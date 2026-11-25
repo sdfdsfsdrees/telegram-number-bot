@@ -1,4 +1,3 @@
-import os
 import asyncio
 import html
 import logging
@@ -18,8 +17,8 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 # ============================================================ НАСТРОЙКИ
 # Впиши один раз и сохрани файл. Дальше бот запускается сразу.
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+BOT_TOKEN = 9136637036:AAHY7_H1S61HzBtPGMfufoCRUCNdEneke9A   # токен от @BotFather, например "123456:ABC-DEF..."
+ADMIN_ID = 1650081425     # твой Telegram ID (число), например 123456789
 
 USER_COOLDOWN = 30        # пауза между выдачами одному человеку в чате (сек), 0 = без паузы
 MAX_WORDS = 4             # сообщения длиннее этого числа слов игнорируются...
