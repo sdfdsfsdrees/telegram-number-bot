@@ -1,3 +1,4 @@
+
 import os
 import re
 import asyncio
@@ -261,7 +262,12 @@ async def add_chat(m: Message):
 
 
 # Добавление ключевого слова из меню
-@dp.message(F.text)
+@dp.message(
+    F.text,
+    lambda m: m.chat.type == "private"
+    and bool(m.from_user)
+    and pending.get(m.from_user.id) == "keyword"
+)
 async def text_handler(m: Message):
     if m.from_user and is_admin(m.from_user.id):
         if m.chat.type == "private" and pending.get(m.from_user.id) == "keyword":
@@ -276,7 +282,7 @@ async def text_handler(m: Message):
                 db.execute("INSERT INTO keywords (word) VALUES (?)", (word,))
                 db.commit()
                 await m.answer(f"✅ Добавлено: {word}")
-                except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError:
                 await m.answer("Такое слово уже есть.")
             return
 
