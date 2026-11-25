@@ -1,75 +1,100 @@
-
+import asyncio
+import logging
 import os
 import re
-import asyncio
 import sqlite3
+import time
 
-from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from dotenv import load_dotenv
 
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DB_PATH = os.getenv("DB_PATH", "numbers.db")
+# Пауза между выдачами одному человеку в одном чате (секунды). 0 = без паузы.
+USER_COOLDOWN = int(os.getenv("USER_COOLDOWN", "30"))
+# Как часто писать в чат «номера закончились» (секунды).
+EMPTY_NOTICE_COOLDOWN = 300
 
 if not TOKEN or not ADMIN_ID:
     raise RuntimeError("Проверь BOT_TOKEN и ADMIN_ID в .env")
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("number_bot")
+
 bot = Bot(TOKEN)
 dp = Dispatcher()
-db = sqlite3.connect("numbers.db", check_same_thread=False)
+
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute("PRAGMA journal_mode=WAL")
 db.execute("PRAGMA busy_timeout=5000")
-lock = asyncio.Lock()
-pending = {}
 
-# База данных
+pending = {}          # user_id -> ожидаемое действие (например "keyword")
+last_issue = {}       # (chat_id, user_id) -> время последней выдачи
+empty_notice = {}     # chat_id -> время последнего сообщения «закончились»
+state = {"admin_notified": False, "kw_regex": None}
+
+
+# ---------------------------------------------------------------- База данных
+
+def add_column(table, column, ddl):
+    cols = [r[1] for r in db.execute(f"PRAGMA table_info({table})")]
+    if column not in cols:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 db.execute("""
 CREATE TABLE IF NOT EXISTS numbers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     number TEXT NOT NULL,
     used INTEGER DEFAULT 0
 )""")
-
 db.execute("""
 CREATE TABLE IF NOT EXISTS chats (
     chat_id INTEGER PRIMARY KEY,
     title TEXT DEFAULT '',
     enabled INTEGER DEFAULT 1
 )""")
-
-# Обновление старой базы
-columns = [x[1] for x in db.execute("PRAGMA table_info(chats)")]
-if "title" not in columns:
-    db.execute("ALTER TABLE chats ADD COLUMN title TEXT DEFAULT ''")
-
-columns = [x[1] for x in db.execute("PRAGMA table_info(numbers)")]
-if "used" not in columns:
-    db.execute("ALTER TABLE numbers ADD COLUMN used INTEGER DEFAULT 0")
-
 db.execute("""
 CREATE TABLE IF NOT EXISTS keywords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     word TEXT UNIQUE COLLATE NOCASE
 )""")
-
 db.execute("""
 CREATE TABLE IF NOT EXISTS settings (
     name TEXT PRIMARY KEY,
     value TEXT
 )""")
 
+# Миграции старой базы + новые колонки для истории выдачи
+add_column("chats", "title", "TEXT DEFAULT ''")
+add_column("numbers", "used", "INTEGER DEFAULT 0")
+add_column("numbers", "used_at", "INTEGER")
+add_column("numbers", "used_by", "INTEGER")
+add_column("numbers", "used_by_name", "TEXT")
+add_column("numbers", "used_chat", "INTEGER")
+
 db.execute("INSERT OR IGNORE INTO settings VALUES ('enabled', '1')")
-
-for word in ("слет", "слёт", "номер"):
-    db.execute("INSERT OR IGNORE INTO keywords (word) VALUES (?)", (word,))
-
+for _w in ("слет", "номер"):
+    db.execute("INSERT OR IGNORE INTO keywords (word) VALUES (?)", (_w,))
 db.execute("CREATE INDEX IF NOT EXISTS idx_numbers_used ON numbers(used, id)")
 db.commit()
 
+
+# ------------------------------------------------------------------- Помощники
 
 def is_admin(user_id):
     return user_id == ADMIN_ID
@@ -81,6 +106,56 @@ def enabled():
     ).fetchone()[0] == "1"
 
 
+def norm(text):
+    """Нижний регистр + ё -> е, чтобы «слёт» и «слет» были одним словом."""
+    return text.casefold().replace("ё", "е")
+
+
+def reload_keywords():
+    """Один раз собираем регулярку, а не лезем в базу на каждое сообщение."""
+    words = [r[0] for r in db.execute("SELECT word FROM keywords")]
+    if not words:
+        state["kw_regex"] = None
+        return
+    parts = sorted({re.escape(norm(w)) for w in words}, key=len, reverse=True)
+    state["kw_regex"] = re.compile(r"(?<!\w)(?:" + "|".join(parts) + r")(?!\w)")
+
+
+def number_counts():
+    total, free = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(used=0), 0) FROM numbers"
+    ).fetchone()
+    return total, free
+
+
+def numbers_added():
+    """После пополнения базы снова разрешаем уведомить админа о конце номеров."""
+    state["admin_notified"] = False
+
+
+def short(text, limit=30):
+    text = str(text)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def is_admin_private(m: Message):
+    return bool(m.from_user) and is_admin(m.from_user.id) and m.chat.type == "private"
+
+
+async def safe_edit(c: CallbackQuery, text=None, markup=None):
+    """Не падаем, если Telegram говорит «message is not modified»."""
+    try:
+        if text is None:
+            await c.message.edit_reply_markup(reply_markup=markup)
+        else:
+            await c.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
+# ------------------------------------------------------------------- Клавиатуры
+
 def button(text, data):
     return InlineKeyboardButton(text=text, callback_data=data)
 
@@ -91,7 +166,7 @@ def menu():
         [button(status, "bot:toggle")],
         [button("💬 Чаты", "chats"), button("📱 Номера", "numbers")],
         [button("🔑 Ключевые слова", "keywords")],
-        [button("📊 Статистика", "stats")]
+        [button("📊 Статистика", "stats")],
     ])
 
 
@@ -99,14 +174,13 @@ def chat_menu():
     rows = db.execute(
         "SELECT chat_id, title, enabled FROM chats ORDER BY title"
     ).fetchall()
-
     keyboard = [
         [
             button(
-                f"{'🟢' if active else '🔴'} {title or chat_id}",
-                f"chat:{chat_id}"
+                f"{'🟢' if active else '🔴'} {short(title or chat_id)}",
+                f"chat:{chat_id}",
             ),
-            button("❌", f"remove:{chat_id}")
+            button("❌", f"remove:{chat_id}"),
         ]
         for chat_id, title, active in rows
     ]
@@ -115,136 +189,40 @@ def chat_menu():
 
 
 def keyword_menu():
-    rows = db.execute(
-        "SELECT id, word FROM keywords ORDER BY id"
-    ).fetchall()
-
-    keyboard = [
-        [button(f"❌ {word}", f"kwdel:{kid}")]
-        for kid, word in rows
-    ]
+    rows = db.execute("SELECT id, word FROM keywords ORDER BY id").fetchall()
+    keyboard = [[button(f"❌ {short(word)}", f"kwdel:{kid}")] for kid, word in rows]
     keyboard += [
         [button("➕ Добавить слово", "kwadd")],
-        [button("⬅️ В меню", "home")]
+        [button("⬅️ В меню", "home")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
+PANEL_TEXT = "🤖 NUMBER BOT 3.1\n\nПанель управления:"
+
+
+# --------------------------------------------------------------------- Команды
+
 @dp.message(Command("start", "panel"))
 async def start(m: Message):
-    if is_admin(m.from_user.id):
-        await m.answer("🤖 NUMBER BOT 3.0\n\nПанель управления:", reply_markup=menu())
+    if m.chat.type != "private":
+        return
+    if m.from_user and is_admin(m.from_user.id):
+        await m.answer(PANEL_TEXT, reply_markup=menu())
     else:
         await m.answer("Бот работает.")
 
 
-@dp.callback_query()
-async def callbacks(c: CallbackQuery):
-    if not is_admin(c.from_user.id):
-        await c.answer("Нет доступа", show_alert=True)
-        return
-
-    data = c.data
-
-    if data == "home":
-        await c.message.edit_text(
-            "🤖 NUMBER BOT 3.0\n\nПанель управления:",
-            reply_markup=menu()
-        )
-
-    elif data == "bot:toggle":
-        db.execute(
-            "UPDATE settings SET value=? WHERE name='enabled'",
-            ("0" if enabled() else "1",)
-        )
-        db.commit()
-        await c.message.edit_reply_markup(reply_markup=menu())
-
-    elif data == "chats":
-        await c.message.answer(
-            "💬 Подключённые чаты\n\nНажми на чат, чтобы включить или выключить его:",
-            reply_markup=chat_menu()
-        )
-
-    elif data.startswith("chat:"):
-        cid = int(data.split(":")[1])
-        db.execute(
-            "UPDATE chats SET enabled=1-enabled WHERE chat_id=?", (cid,)
-        )
-        db.commit()
-        await c.message.edit_reply_markup(reply_markup=chat_menu())
-
-    elif data.startswith("remove:"):
-        cid = int(data.split(":")[1])
-        db.execute("DELETE FROM chats WHERE chat_id=?", (cid,))
-        db.commit()
-        await c.message.edit_reply_markup(reply_markup=chat_menu())
-
-    elif data == "numbers":
-        total, free = db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(used=0), 0) FROM numbers"
-        ).fetchone()
-
-        await c.message.answer(
-            f"📱 НОМЕРА\n\nВсего: {total}\n"
-            f"Свободно: {free}\nВыдано: {total-free}\n\n"
-            "Добавить один: /add номер\n"
-            "Добавить список: /addmany\n"
-            "Посмотреть свободные: /list\n"
-            "Удалить по ID: /delete ID"
-        )
-
-    elif data == "keywords":
-        await c.message.answer(
-            "🔑 КЛЮЧЕВЫЕ СЛОВА\n\n"
-            "Нажми на слово, чтобы удалить его.",
-            reply_markup=keyword_menu()
-        )
-
-    elif data == "kwadd":
-        pending[c.from_user.id] = "keyword"
-        await c.message.answer(
-            "✏️ Отправь новое ключевое слово или фразу.\n"
-            "Для отмены напиши /cancel."
-        )
-
-    elif data.startswith("kwdel:"):
-        kid = int(data.split(":")[1])
-        db.execute("DELETE FROM keywords WHERE id=?", (kid,))
-        db.commit()
-        await c.message.edit_reply_markup(reply_markup=keyword_menu())
-
-    elif data == "stats":
-        total, free = db.execute(
-            "SELECT COUNT(*), COALESCE(SUM(used=0), 0) FROM numbers"
-        ).fetchone()
-        chats = db.execute(
-            "SELECT COUNT(*) FROM chats WHERE enabled=1"
-        ).fetchone()[0]
-        words = db.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
-
-        await c.message.answer(
-            f"📊 СТАТИСТИКА\n\n"
-            f"Состояние: {'Включён' if enabled() else 'Выключен'}\n"
-            f"Всего номеров: {total}\n"
-            f"Свободно: {free}\n"
-            f"Выдано: {total-free}\n"
-            f"Активных чатов: {chats}\n"
-            f"Ключевых слов: {words}"
-        )
-
-    await c.answer()
-
-
 @dp.message(Command("cancel"))
 async def cancel(m: Message):
-    pending.pop(m.from_user.id, None)
+    if m.from_user:
+        pending.pop(m.from_user.id, None)
     await m.answer("Действие отменено.")
 
 
 @dp.message(Command("addchat"))
 async def add_chat(m: Message):
-    if not is_admin(m.from_user.id):
+    if not m.from_user or not is_admin(m.from_user.id):
         return
 
     if m.chat.type == "private":
@@ -261,90 +239,134 @@ async def add_chat(m: Message):
     await m.answer("✅ Чат подключён!")
 
 
-# Добавление ключевого слова из меню
-@dp.message(
-    F.text,
-    lambda m: m.chat.type == "private"
-    and bool(m.from_user)
-    and pending.get(m.from_user.id) == "keyword"
-)
-async def text_handler(m: Message):
-    if m.from_user and is_admin(m.from_user.id):
-        if m.chat.type == "private" and pending.get(m.from_user.id) == "keyword":
-            word = m.text.strip()
-            pending.pop(m.from_user.id, None)
-
-            if not word or len(word) > 60:
-                await m.answer("Слово пустое или слишком длинное.")
-                return
-
-            try:
-                db.execute("INSERT INTO keywords (word) VALUES (?)", (word,))
-                db.commit()
-                await m.answer(f"✅ Добавлено: {word}")
-            except sqlite3.IntegrityError:
-                await m.answer("Такое слово уже есть.")
-            return
-
-
 @dp.message(Command("add"))
 async def add_number(m: Message):
-    if not is_admin(m.from_user.id) or m.chat.type != "private":
+    if not is_admin_private(m):
         return
 
     parts = m.text.split(maxsplit=1)
-    if len(parts) < 2:
+    if len(parts) < 2 or not parts[1].strip():
         await m.answer("Используй: /add +79990000000")
         return
 
     number = parts[1].strip()
+    if db.execute("SELECT 1 FROM numbers WHERE number=?", (number,)).fetchone():
+        await m.answer("Такой номер уже есть.")
+        return
+
     db.execute("INSERT INTO numbers (number) VALUES (?)", (number,))
     db.commit()
+    numbers_added()
     await m.answer("✅ Номер добавлен!")
 
 
 @dp.message(Command("addmany"))
 async def add_many(m: Message):
-    if not is_admin(m.from_user.id) or m.chat.type != "private":
+    if not is_admin_private(m):
         return
 
-    lines = m.text.splitlines()[1:]
-    added = 0
+    # Номера можно писать и в первой строке рядом с командой, и ниже
+    parts = m.text.split(maxsplit=1)
+    raw = parts[1] if len(parts) > 1 else ""
+    numbers = list(dict.fromkeys(x.strip() for x in raw.splitlines() if x.strip()))
 
-    for number in dict.fromkeys(x.strip() for x in lines if x.strip()):
-        exists = db.execute(
+    if not numbers:
+        await m.answer("Используй:\n/addmany\n+79990000001\n+79990000002")
+        return
+
+    added = 0
+    for number in numbers:
+        if not db.execute(
             "SELECT 1 FROM numbers WHERE number=?", (number,)
-        ).fetchone()
-        if not exists:
+        ).fetchone():
             db.execute("INSERT INTO numbers (number) VALUES (?)", (number,))
             added += 1
 
     db.commit()
-    await m.answer(f"✅ Добавлено номеров: {added}")
+    if added:
+        numbers_added()
+    await m.answer(
+        f"✅ Добавлено номеров: {added}\n"
+        f"Пропущено (уже были): {len(numbers) - added}"
+    )
 
 
 @dp.message(Command("list"))
 async def list_numbers(m: Message):
-    if not is_admin(m.from_user.id) or m.chat.type != "private":
+    if not is_admin_private(m):
         return
 
     rows = db.execute(
         "SELECT id, number FROM numbers WHERE used=0 ORDER BY id LIMIT 50"
     ).fetchall()
+    _, free = number_counts()
 
-    await m.answer(
-        "\n".join(f"{i}. {n}" for i, n in rows)
-        if rows else "Свободных номеров нет."
-    )
+    if not rows:
+        await m.answer("Свободных номеров нет.")
+        return
+
+    text = "\n".join(f"{i}. {n}" for i, n in rows)
+    if free > len(rows):
+        text += f"\n\n…и ещё {free - len(rows)}"
+    await m.answer(text)
+
+
+@dp.message(Command("history"))
+async def history(m: Message):
+    """Последние 20 выданных номеров: кому, где и когда."""
+    if not is_admin_private(m):
+        return
+
+    rows = db.execute("""
+        SELECT n.id, n.number, n.used_at, n.used_by_name,
+               COALESCE(c.title, n.used_chat)
+        FROM numbers n
+        LEFT JOIN chats c ON c.chat_id = n.used_chat
+        WHERE n.used=1
+        ORDER BY n.used_at DESC, n.id DESC
+        LIMIT 20
+    """).fetchall()
+
+    if not rows:
+        await m.answer("Выдач пока не было.")
+        return
+
+    lines = []
+    for nid, number, ts, who, chat in rows:
+        when = time.strftime("%d.%m %H:%M", time.localtime(ts)) if ts else "—"
+        lines.append(f"{nid}. {number} → {who or '—'} ({chat or '—'}, {when})")
+    await m.answer("📜 Последние выдачи:\n\n" + "\n".join(lines))
+
+
+@dp.message(Command("restore"))
+async def restore_number(m: Message):
+    """Вернуть выданный номер обратно в свободные."""
+    if not is_admin_private(m):
+        return
+
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await m.answer("Используй: /restore ID")
+        return
+
+    cur = db.execute("""
+        UPDATE numbers
+        SET used=0, used_at=NULL, used_by=NULL, used_by_name=NULL, used_chat=NULL
+        WHERE id=? AND used=1
+    """, (int(parts[1]),))
+    db.commit()
+    if cur.rowcount:
+        numbers_added()
+    await m.answer("✅ Номер снова свободен." if cur.rowcount else "Номер не найден или не выдан.")
 
 
 @dp.message(Command("delete"))
 async def delete_number(m: Message):
-    if not is_admin(m.from_user.id) or m.chat.type != "private":
+    if not is_admin_private(m):
         return
 
     parts = m.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].isdigit():
+    if len(parts) < 2 or not parts[1].strip().isdigit():
         await m.answer("Используй: /delete ID")
         return
 
@@ -353,10 +375,170 @@ async def delete_number(m: Message):
     await m.answer("✅ Удалено." if cur.rowcount else "Номер не найден.")
 
 
-# Автоматическая выдача
+# -------------------------------------------------------------- Кнопки (меню)
+
+@dp.callback_query()
+async def callbacks(c: CallbackQuery):
+    if not is_admin(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True)
+        return
+
+    if c.message is None:
+        await c.answer()
+        return
+
+    data = c.data
+
+    if data == "home":
+        await safe_edit(c, PANEL_TEXT, menu())
+
+    elif data == "bot:toggle":
+        db.execute(
+            "UPDATE settings SET value=? WHERE name='enabled'",
+            ("0" if enabled() else "1",),
+        )
+        db.commit()
+        await safe_edit(c, markup=menu())
+
+    elif data == "chats":
+        await c.message.answer(
+            "💬 Подключённые чаты\n\n"
+            "Нажми на чат, чтобы включить или выключить его.\n"
+            "Новый чат: добавь бота в группу и отправь там /addchat",
+            reply_markup=chat_menu(),
+        )
+
+    elif data.startswith("chat:"):
+        cid = int(data.split(":")[1])
+        db.execute("UPDATE chats SET enabled=1-enabled WHERE chat_id=?", (cid,))
+        db.commit()
+        await safe_edit(c, markup=chat_menu())
+
+    elif data.startswith("remove:"):
+        cid = int(data.split(":")[1])
+        db.execute("DELETE FROM chats WHERE chat_id=?", (cid,))
+        db.commit()
+        await safe_edit(c, markup=chat_menu())
+
+    elif data == "numbers":
+        total, free = number_counts()
+        await c.message.answer(
+            f"📱 НОМЕРА\n\nВсего: {total}\n"
+            f"Свободно: {free}\nВыдано: {total - free}\n\n"
+            "Добавить один: /add номер\n"
+            "Добавить список: /addmany (номера с новой строки)\n"
+            "Свободные: /list\n"
+            "История выдач: /history\n"
+            "Вернуть номер в свободные: /restore ID\n"
+            "Удалить по ID: /delete ID"
+        )
+
+    elif data == "keywords":
+        await c.message.answer(
+            "🔑 КЛЮЧЕВЫЕ СЛОВА\n\nНажми на слово, чтобы удалить его.",
+            reply_markup=keyword_menu(),
+        )
+
+    elif data == "kwadd":
+        pending[c.from_user.id] = "keyword"
+        await c.message.answer(
+            "✏️ Отправь новое ключевое слово или фразу.\n"
+            "Для отмены напиши /cancel."
+        )
+
+    elif data.startswith("kwdel:"):
+        kid = int(data.split(":")[1])
+        db.execute("DELETE FROM keywords WHERE id=?", (kid,))
+        db.commit()
+        reload_keywords()
+        await safe_edit(c, markup=keyword_menu())
+
+    elif data == "stats":
+        total, free = number_counts()
+        chats = db.execute(
+            "SELECT COUNT(*) FROM chats WHERE enabled=1"
+        ).fetchone()[0]
+        words = db.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+
+        await c.message.answer(
+            f"📊 СТАТИСТИКА\n\n"
+            f"Состояние: {'Включён' if enabled() else 'Выключен'}\n"
+            f"Всего номеров: {total}\n"
+            f"Свободно: {free}\n"
+            f"Выдано: {total - free}\n"
+            f"Активных чатов: {chats}\n"
+            f"Ключевых слов: {words}"
+        )
+
+    await c.answer()
+
+
+# ------------------------------------------------ Добавление ключевого слова
+
+def awaiting_keyword(m: Message):
+    return (
+        m.chat.type == "private"
+        and m.from_user is not None
+        and is_admin(m.from_user.id)
+        and pending.get(m.from_user.id) == "keyword"
+        and not (m.text or "").startswith("/")  # команды не считаем словом
+    )
+
+
+@dp.message(F.text, awaiting_keyword)
+async def keyword_input(m: Message):
+    word = m.text.strip()
+    pending.pop(m.from_user.id, None)
+
+    if not word or len(word) > 60:
+        await m.answer("Слово пустое или слишком длинное.")
+        return
+
+    try:
+        db.execute("INSERT INTO keywords (word) VALUES (?)", (word,))
+        db.commit()
+    except sqlite3.IntegrityError:
+        await m.answer("Такое слово уже есть.")
+        return
+
+    reload_keywords()
+    await m.answer(f"✅ Добавлено: {word}")
+
+
+# ---------------------------------------------------------- Автоматическая выдача
+
+async def handle_empty(m: Message):
+    """Номера закончились: не спамим чат и один раз предупреждаем админа."""
+    now = time.monotonic()
+    if now - empty_notice.get(m.chat.id, float("-inf")) > EMPTY_NOTICE_COOLDOWN:
+        empty_notice[m.chat.id] = now
+        try:
+            await m.reply("Свободные номера закончились.")
+        except Exception:
+            log.exception("Не удалось отправить сообщение о конце номеров")
+
+    if not state["admin_notified"]:
+        state["admin_notified"] = True
+        try:
+            await bot.send_message(ADMIN_ID, "⚠️ Свободные номера закончились. Добавь новые: /addmany")
+        except Exception:
+            log.exception("Не удалось уведомить админа")
+
+
+def purge_cooldowns(now):
+    if len(last_issue) > 5000:
+        for key in [k for k, t in last_issue.items() if now - t > USER_COOLDOWN]:
+            del last_issue[key]
+
+
 @dp.message(F.text)
 async def auto_reply(m: Message):
-    if m.chat.type == "private" or (m.from_user and m.from_user.is_bot):
+    if m.chat.type == "private" or not m.from_user or m.from_user.is_bot:
+        return
+
+    # Сначала дешёвая проверка по тексту, потом уже база
+    regex = state["kw_regex"]
+    if regex is None or not regex.search(norm(m.text)):
         return
 
     if not enabled():
@@ -365,44 +547,61 @@ async def auto_reply(m: Message):
     chat = db.execute(
         "SELECT enabled FROM chats WHERE chat_id=?", (m.chat.id,)
     ).fetchone()
-
     if not chat or not chat[0]:
         return
 
-    words = db.execute("SELECT word FROM keywords").fetchall()
-    text = m.text.casefold()
+    user_id = m.from_user.id
+    now = time.monotonic()
 
-    matched = any(
-        re.search(rf"(?<!\w){re.escape(word.casefold())}(?!\w)", text)
-        for (word,) in words
-    )
-
-    if not matched:
-        return
-
-    async with lock:
-        row = db.execute("""
-            SELECT id, number FROM numbers
-            WHERE used=0 ORDER BY id LIMIT 1
-        """).fetchone()
-
-        if not row:
-            await m.reply("Свободные номера закончились.")
+    # Защита от спама: один человек не вычерпает все номера (админа не касается)
+    if USER_COOLDOWN and not is_admin(user_id):
+        last = last_issue.get((m.chat.id, user_id))
+        if last is not None and now - last < USER_COOLDOWN:
             return
 
-        db.execute("UPDATE numbers SET used=1 WHERE id=?", (row[0],))
+    # Между SELECT и UPDATE нет await, поэтому два сообщения не получат один номер,
+    # а блокировка на время отправки больше не тормозит остальные ответы.
+    row = db.execute(
+        "SELECT id, number FROM numbers WHERE used=0 ORDER BY id LIMIT 1"
+    ).fetchone()
+
+    if not row:
+        await handle_empty(m)
+        return
+
+    who = (
+        f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
+    )
+    db.execute(
+        "UPDATE numbers SET used=1, used_at=?, used_by=?, used_by_name=?, used_chat=? "
+        "WHERE id=?",
+        (int(time.time()), user_id, who, m.chat.id, row[0]),
+    )
+    db.commit()
+
+    try:
+        await m.reply(f"📱 Номер: {row[1]}")
+    except Exception:
+        # Не отправилось (сообщение удалили, нет прав и т.д.) — возвращаем номер
+        log.exception("Ошибка отправки номера, возвращаю его в свободные")
+        db.execute(
+            "UPDATE numbers SET used=0, used_at=NULL, used_by=NULL, "
+            "used_by_name=NULL, used_chat=NULL WHERE id=?",
+            (row[0],),
+        )
         db.commit()
+        return
 
-        try:
-            await m.reply(f"📱 Номер: {row[1]}")
-        except Exception:
-            db.execute("UPDATE numbers SET used=0 WHERE id=?", (row[0],))
-            db.commit()
-            raise
+    last_issue[(m.chat.id, user_id)] = now
+    purge_cooldowns(now)
+    log.info("Номер %s выдан %s в чате %s", row[1], who, m.chat.id)
 
+
+# ----------------------------------------------------------------------- Запуск
 
 async def main():
-    print("NUMBER BOT 3.0 запущен!")
+    reload_keywords()
+    log.info("NUMBER BOT 3.1 запущен!")
     try:
         await dp.start_polling(bot)
     finally:
