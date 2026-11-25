@@ -92,7 +92,24 @@ async def chats(message: Message):
         "\n".join(f"{chat_id}: {'включён' if enabled else 'выключен'}"
                   for chat_id, enabled in rows)
     )
+@dp.message(Command("addchat"))
+async def add_chat(message: Message):
+    if not is_admin(message):
+        return
 
+    if message.chat.type == "private":
+        await message.answer(
+            "Добавь бота в нужную группу и отправь там /addchat"
+        )
+        return
+
+    db.execute(
+        "INSERT OR REPLACE INTO chats (chat_id, enabled) VALUES (?, 1)",
+        (message.chat.id,)
+    )
+    db.commit()
+
+    await message.answer("✅ Этот чат подключён!")
 @dp.message(F.text)
 async def handle_message(message: Message):
     if not message.chat or message.chat.type == "private":
