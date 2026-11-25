@@ -6,6 +6,7 @@ import sqlite3
 import time
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
@@ -15,6 +16,12 @@ from aiogram.types import (
     Message,
 )
 from dotenv import load_dotenv
+
+try:  # быстрый цикл событий (Linux/macOS); на Windows просто пропускается
+    import uvloop
+    uvloop.install()
+except ImportError:
+    pass
 
 load_dotenv()
 
@@ -35,17 +42,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("number_bot")
 
-bot = Bot(TOKEN)
+# Держим соединение с Telegram живым: иначе после пары секунд простоя
+# следующий ответ тратит 100-300 мс на новое TCP+TLS-соединение.
+session = AiohttpSession()
+if hasattr(session, "_connector_init"):
+    session._connector_init["keepalive_timeout"] = 120
+bot = Bot(TOKEN, session=session)
 dp = Dispatcher()
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute("PRAGMA journal_mode=WAL")
 db.execute("PRAGMA busy_timeout=5000")
+db.execute("PRAGMA synchronous=NORMAL")   # в WAL безопасно, но без fsync на каждый commit
+db.execute("PRAGMA temp_store=MEMORY")
+db.execute("PRAGMA cache_size=-16000")
 
 pending = {}          # user_id -> ожидаемое действие (например "keyword")
 last_issue = {}       # (chat_id, user_id) -> время последней выдачи
 empty_notice = {}     # chat_id -> время последнего сообщения «закончились»
-state = {"admin_notified": False, "kw_regex": None}
+state = {"admin_notified": False, "kw_regex": None, "enabled": True}
+active_chats = set()  # chat_id включённых чатов — в памяти, без запросов в базу
 
 
 # ---------------------------------------------------------------- База данных
@@ -101,9 +117,20 @@ def is_admin(user_id):
 
 
 def enabled():
-    return db.execute(
+    return state["enabled"]
+
+
+def reload_enabled():
+    state["enabled"] = db.execute(
         "SELECT value FROM settings WHERE name='enabled'"
     ).fetchone()[0] == "1"
+
+
+def reload_chats():
+    active_chats.clear()
+    active_chats.update(
+        r[0] for r in db.execute("SELECT chat_id FROM chats WHERE enabled=1")
+    )
 
 
 def norm(text):
@@ -236,6 +263,7 @@ async def add_chat(m: Message):
         title=excluded.title, enabled=1
     """, (m.chat.id, m.chat.title or "Группа"))
     db.commit()
+    reload_chats()
     await m.answer("✅ Чат подключён!")
 
 
@@ -398,6 +426,7 @@ async def callbacks(c: CallbackQuery):
             ("0" if enabled() else "1",),
         )
         db.commit()
+        reload_enabled()
         await safe_edit(c, markup=menu())
 
     elif data == "chats":
@@ -412,12 +441,14 @@ async def callbacks(c: CallbackQuery):
         cid = int(data.split(":")[1])
         db.execute("UPDATE chats SET enabled=1-enabled WHERE chat_id=?", (cid,))
         db.commit()
+        reload_chats()
         await safe_edit(c, markup=chat_menu())
 
     elif data.startswith("remove:"):
         cid = int(data.split(":")[1])
         db.execute("DELETE FROM chats WHERE chat_id=?", (cid,))
         db.commit()
+        reload_chats()
         await safe_edit(c, markup=chat_menu())
 
     elif data == "numbers":
@@ -533,6 +564,7 @@ def purge_cooldowns(now):
 
 @dp.message(F.text)
 async def auto_reply(m: Message):
+    t0 = time.perf_counter()
     if m.chat.type == "private" or not m.from_user or m.from_user.is_bot:
         return
 
@@ -541,13 +573,7 @@ async def auto_reply(m: Message):
     if regex is None or not regex.search(norm(m.text)):
         return
 
-    if not enabled():
-        return
-
-    chat = db.execute(
-        "SELECT enabled FROM chats WHERE chat_id=?", (m.chat.id,)
-    ).fetchone()
-    if not chat or not chat[0]:
+    if not state["enabled"] or m.chat.id not in active_chats:
         return
 
     user_id = m.from_user.id
@@ -579,6 +605,7 @@ async def auto_reply(m: Message):
     )
     db.commit()
 
+    t1 = time.perf_counter()
     try:
         await m.reply(f"📱 Номер: {row[1]}")
     except Exception:
@@ -594,17 +621,42 @@ async def auto_reply(m: Message):
 
     last_issue[(m.chat.id, user_id)] = now
     purge_cooldowns(now)
-    log.info("Номер %s выдан %s в чате %s", row[1], who, m.chat.id)
+    t2 = time.perf_counter()
+    log.info(
+        "Номер %s выдан %s в чате %s | обработка %.1f мс, отправка в Telegram %.0f мс, "
+        "сообщение дошло до бота за ~%d с",
+        row[1], who, m.chat.id,
+        (t1 - t0) * 1000, (t2 - t1) * 1000,
+        max(0, int(time.time() - m.date.timestamp())),
+    )
 
 
 # ----------------------------------------------------------------------- Запуск
 
+async def keep_warm():
+    """Лёгкий пинг, чтобы соединение с Telegram не засыпало между выдачами."""
+    while True:
+        await asyncio.sleep(20)
+        try:
+            await bot.get_me()
+        except Exception:
+            pass
+
+
 async def main():
     reload_keywords()
+    reload_enabled()
+    reload_chats()
     log.info("NUMBER BOT 3.1 запущен!")
+    warm = asyncio.create_task(keep_warm())
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query"],
+            polling_timeout=30,
+        )
     finally:
+        warm.cancel()
         await bot.session.close()
         db.close()
 
