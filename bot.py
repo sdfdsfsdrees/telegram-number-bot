@@ -7,13 +7,9 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    BotCommand
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
 )
-from aiogram.exceptions import TelegramBadRequest
 
 load_dotenv()
 
@@ -21,491 +17,257 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 if not TOKEN or not ADMIN_ID:
-    raise RuntimeError("Проверь BOT_TOKEN и ADMIN_ID в файле .env")
+    raise RuntimeError("Проверь BOT_TOKEN и ADMIN_ID в .env")
 
-bot = Bot(token=TOKEN)
+bot = Bot(TOKEN)
 dp = Dispatcher()
-
 db = sqlite3.connect("numbers.db", check_same_thread=False)
-db.execute("""
-CREATE TABLE IF NOT EXISTS numbers (
+db.execute("PRAGMA journal_mode=WAL")
+db.execute("""CREATE TABLE IF NOT EXISTS numbers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     number TEXT NOT NULL,
     used INTEGER DEFAULT 0
-)
-""")
-db.execute("""
-CREATE TABLE IF NOT EXISTS chats (
+)""")
+db.execute("""CREATE TABLE IF NOT EXISTS chats (
     chat_id INTEGER PRIMARY KEY,
-    enabled INTEGER DEFAULT 1,
-    title TEXT DEFAULT ''
-)
-""")
-
-# Обновление старой базы данных
-try:
-    db.execute("ALTER TABLE chats ADD COLUMN title TEXT DEFAULT ''")
-except sqlite3.OperationalError:
-    pass
-
+    title TEXT,
+    enabled INTEGER DEFAULT 1
+)""")
 db.commit()
 
-number_lock = asyncio.Lock()
-
-KEYWORDS = [
-    "слет",
-    "номер",
-    "дай номер",
-    "нужен номер"
-]
+lock = asyncio.Lock()
 
 
-def is_admin(message):
-    return (
-        message.from_user is not None
-        and message.from_user.id == ADMIN_ID
-    )
+def admin(user_id):
+    return user_id == ADMIN_ID
 
 
-def admin_keyboard():
+def panel():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(
-                text="💬 Мои чаты",
-                callback_data="chats"
-            ),
-            InlineKeyboardButton(
-                text="📱 Номера",
-                callback_data="numbers"
-            )
+            InlineKeyboardButton(text="💬 Чаты", callback_data="chats"),
+            InlineKeyboardButton(text="📱 Номера", callback_data="numbers")
         ],
         [
-            InlineKeyboardButton(
-                text="➕ Как добавить чат",
-                callback_data="addchat_help"
-            ),
-            InlineKeyboardButton(
-                text="📊 Статистика",
-                callback_data="stats"
-            )
+            InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
+            InlineKeyboardButton(text="➕ Подключить чат", callback_data="help")
         ]
     ])
 
 
-@dp.message(Command("start"))
-async def start(message: Message):
-    if is_admin(message):
-        await message.answer(
-            "🤖 Number Bot 2.0\n\n"
-            "Панель управления готова.",
-            reply_markup=admin_keyboard()
-        )
-    else:
-        await message.answer("Бот работает.")
-
-
-@dp.message(Command("panel"))
-async def panel(message: Message):
-    if not is_admin(message):
-        return
-
-    await message.answer(
-        "⚙️ Панель управления",
-        reply_markup=admin_keyboard()
-    )
-
-
-@dp.callback_query(F.data == "addchat_help")
-async def addchat_help(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    await callback.message.answer(
-        "💬 Подключение группы:\n\n"
-        "1. Добавь бота в нужную группу.\n"
-        "2. Отправь в группе команду /addchat.\n"
-        "3. Группа появится в панели управления.\n\n"
-        "Бот должен иметь доступ к сообщениям группы."
-    )
-    await callback.answer()
-
-
-@dp.message(Command("addchat"))
-async def add_chat(message: Message):
-    if not is_admin(message):
-        return
-
-    if message.chat.type == "private":
-        args = message.text.split(maxsplit=1)
-
-        if len(args) < 2:
-            await message.answer(
-                "Чтобы подключить группу, добавь бота "
-                "в неё и отправь там /addchat.\n\n"
-                "Для публичной группы можно попробовать:\n"
-                "/addchat @username"
-            )
-            return
-
-        target = args[1].strip()
-
-        # Принимаем публичные имена и ссылки t.me
-        if "t.me/" in target:
-            target = target.split("t.me/", 1)[1].strip("/")
-            target = target.split("?", 1)[0]
-
-        if target.startswith("@") or re.fullmatch(
-            r"[A-Za-z0-9_]{5,}", target
-        ):
-            if not target.startswith("@"):
-                target = "@" + target
-        else:
-            await message.answer(
-                "Для закрытой группы используй /addchat "
-                "непосредственно внутри группы."
-            )
-            return
-
-        try:
-            chat = await bot.get_chat(target)
-            member = await bot.get_chat_member(
-                chat.id, bot.id
-            )
-
-            if member.status in ("left", "kicked"):
-                await message.answer(
-                    "Сначала добавь бота в эту группу."
-                )
-                return
-
-        except TelegramBadRequest:
-            await message.answer(
-                "Не удалось найти группу или проверить доступ. "
-                "Добавь бота в группу и отправь /addchat внутри неё."
-            )
-            return
-
-    else:
-        chat = message.chat
-
-    db.execute(
-        """
-        INSERT INTO chats (chat_id, enabled, title)
-        VALUES (?, 1, ?)
-        ON CONFLICT(chat_id) DO UPDATE SET
-        enabled = 1,
-        title = excluded.title
-        """,
-        (chat.id, chat.title or "Группа")
-    )
-    db.commit()
-
-    await message.answer(
-        f"✅ Чат подключён!\n"
-        f"Название: {chat.title or 'Группа'}\n"
-        f"ID: {chat.id}"
-    )
-
-
-@dp.callback_query(F.data == "chats")
-async def show_chats(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
+def chat_buttons():
     rows = db.execute(
-        "SELECT chat_id, enabled, title FROM chats"
+        "SELECT chat_id, title, enabled FROM chats"
     ).fetchall()
 
-    if not rows:
-        await callback.message.answer(
-            "Подключённых чатов пока нет."
-        )
-        await callback.answer()
-        return
-
-    buttons = []
-
-    for chat_id, enabled, title in rows:
-        status = "🟢" if enabled else "🔴"
-
-        buttons.append([
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
             InlineKeyboardButton(
-                text=f"{status} {title or chat_id}",
-                callback_data=f"info:{chat_id}"
-            ),
-            InlineKeyboardButton(
-                text="Вкл/Выкл",
+                text=f"{'🟢' if enabled else '🔴'} {title or chat_id}",
                 callback_data=f"toggle:{chat_id}"
             ),
             InlineKeyboardButton(
                 text="❌",
                 callback_data=f"remove:{chat_id}"
             )
-        ])
-
-    await callback.message.answer(
-        "💬 Подключённые чаты:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=buttons
-        )
-        "Посмотреть: /list\n"
-        "Удалить: /delete ID"
-    )
-    await callback.answer()
+        ]
+        for chat_id, title, enabled in rows
+    ])
 
 
-@dp.callback_query(F.data == "stats")
-async def show_stats(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
+@dp.message(Command("start", "panel"))
+async def start(m: Message):
+    if admin(m.from_user.id):
+        await m.answer("🤖 Number Bot 2.0\nПанель управления:", reply_markup=panel())
+    else:
+        await m.answer("Бот работает.")
+
+
+@dp.callback_query()
+async def buttons(c: CallbackQuery):
+    if not admin(c.from_user.id):
+        await c.answer("Нет доступа", show_alert=True)
         return
 
-    total = db.execute(
-        "SELECT COUNT(*) FROM numbers"
-    ).fetchone()[0]
+    data = c.data
 
-    free = db.execute(
-        "SELECT COUNT(*) FROM numbers WHERE used = 0"
-    ).fetchone()[0]
+    if data == "chats":
+        await c.message.answer("💬 Подключённые чаты:", reply_markup=chat_buttons())
 
-    chats = db.execute(
-        "SELECT COUNT(*) FROM chats WHERE enabled = 1"
-    ).fetchone()[0]
+    elif data == "numbers":
+        total, free = db.execute(
+            "SELECT COUNT(*), SUM(used = 0) FROM numbers"
+        ).fetchone()
+        await c.message.answer(
+            f"📱 Всего: {total}\n"
+            f"Свободно: {free or 0}\n"
+            f"Выдано: {total - (free or 0)}\n\n"
+            "/add номер\n/addmany\n/list\n/delete ID"
+        )
 
-    await callback.message.answer(
-        "📊 Статистика\n\n"
-        f"Всего номеров: {total}\n"
-        f"Свободно: {free}\n"
-        f"Выдано: {total - free}\n"
-        f"Активных чатов: {chats}"
+    elif data == "stats":
+        total, free = db.execute(
+            "SELECT COUNT(*), SUM(used = 0) FROM numbers"
+        ).fetchone()
+        chats = db.execute(
+            "SELECT COUNT(*) FROM chats WHERE enabled = 1"
+        ).fetchone()[0]
+        await c.message.answer(
+            f"📊 Статистика\n"
+            f"Номеров: {total}\n"
+            f"Свободно: {free or 0}\n"
+            f"Активных чатов: {chats}"
+        )
+
+    elif data == "help":
+        await c.message.answer(
+            "Добавь бота в группу и отправь там /addchat."
+        )
+
+    elif data.startswith("toggle:"):
+        chat_id = int(data.split(":")[1])
+        db.execute(
+            "UPDATE chats SET enabled = 1 - enabled WHERE chat_id = ?",
+            (chat_id,)
+        )
+        db.commit()
+        await c.message.edit_reply_markup(reply_markup=chat_buttons())
+
+    elif data.startswith("remove:"):
+        chat_id = int(data.split(":")[1])
+        db.execute("DELETE FROM chats WHERE chat_id = ?", (chat_id,))
+        db.commit()
+        await c.message.edit_reply_markup(reply_markup=chat_buttons())
+
+    await c.answer()
+
+
+@dp.message(Command("addchat"))
+async def add_chat(m: Message):
+    if not admin(m.from_user.id):
+        return
+
+    if m.chat.type == "private":
+        await m.answer("Добавь бота в группу и отправь /addchat внутри неё.")
+        return
+
+    db.execute(
+        """INSERT INTO chats (chat_id, title, enabled)
+        VALUES (?, ?, 1)
+        ON CONFLICT(chat_id) DO UPDATE SET
+        title = excluded.title, enabled = 1""",
+        (m.chat.id, m.chat.title or "Группа")
     )
-    await callback.answer()
+    db.commit()
+    await m.answer("✅ Чат подключён!")
 
 
 @dp.message(Command("add"))
-async def add_number(message: Message):
-    if not is_admin(message):
+async def add_number(m: Message):
+    if not admin(m.from_user.id) or m.chat.type != "private":
         return
 
-    parts = message.text.split(maxsplit=1)
-
+    parts = m.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer(
-            "Используй: /add +79990000000"
-        )
+        await m.answer("Используй: /add +79990000000")
         return
 
     number = parts[1].strip()
+    if not number:
+        return
 
-    db.execute(
-        "INSERT INTO numbers (number) VALUES (?)",
-        (number,)
-    )
+    db.execute("INSERT INTO numbers (number) VALUES (?)", (number,))
     db.commit()
-
-    await message.answer("✅ Номер добавлен!")
+    await m.answer("✅ Номер добавлен!")
 
 
 @dp.message(Command("addmany"))
-async def add_many(message: Message):
-    if not is_admin(message):
+async def add_many(m: Message):
+    if not admin(m.from_user.id) or m.chat.type != "private":
         return
 
-    parts = message.text.split(maxsplit=1)
-
-    if len(parts) < 2:
-        await message.answer(
-            "Отправь номера через новую строку после /addmany"
-        )
-        return
-
-    values = [
-        line.strip()
-        for line in parts[1].splitlines()
-        if line.strip()
-    ]
+    lines = m.text.splitlines()[1:]
+    numbers = list(dict.fromkeys(x.strip() for x in lines if x.strip()))
 
     added = 0
-
-    for number in values:
+    for number in numbers:
         exists = db.execute(
-            "SELECT id FROM numbers WHERE number = ?",
-            (number,)
+            "SELECT 1 FROM numbers WHERE number = ?", (number,)
         ).fetchone()
-
         if not exists:
-            db.execute(
-                "INSERT INTO numbers (number) VALUES (?)",
-                (number,)
-            )
+            db.execute("INSERT INTO numbers (number) VALUES (?)", (number,))
             added += 1
 
     db.commit()
-
-    await message.answer(
-        f"✅ Добавлено: {added}\n"
-        f"Пропущено дубликатов: {len(values) - added}"
-    )
+    await m.answer(f"✅ Добавлено номеров: {added}")
 
 
 @dp.message(Command("list"))
-async def list_numbers(message: Message):
-    if not is_admin(message):
+async def list_numbers(m: Message):
+    if not admin(m.from_user.id) or m.chat.type != "private":
         return
 
     rows = db.execute(
-        "SELECT id, number FROM numbers WHERE used = 0 "
-        "ORDER BY id LIMIT 50"
+        "SELECT id, number FROM numbers WHERE used = 0 ORDER BY id LIMIT 50"
     ).fetchall()
 
-    if not rows:
-        await message.answer("Свободных номеров нет.")
-        return
-
-    result = "\n".join(
-        f"{row[0]}. {row[1]}" for row in rows
+    await m.answer(
+        "\n".join(f"{i}. {n}" for i, n in rows)
+        if rows else "Свободных номеров нет."
     )
-
-    await message.answer("📱 Свободные номера:\n\n" + result)
 
 
 @dp.message(Command("delete"))
-async def delete_number(message: Message):
-    if not is_admin(message):
+async def delete_number(m: Message):
+    if not admin(m.from_user.id) or m.chat.type != "private":
         return
 
-    parts = message.text.split(maxsplit=1)
-
+    parts = m.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Используй: /delete ID")
+        await m.answer("Используй: /delete ID")
         return
 
-    number_id = int(parts[1])
-
-    cursor = db.execute(
-        "DELETE FROM numbers WHERE id = ?",
-        (number_id,)
-    )
+    cur = db.execute("DELETE FROM numbers WHERE id = ?", (int(parts[1]),))
     db.commit()
-
-    await message.answer(
-        "✅ Удалено." if cursor.rowcount else "Номер не найден."
-    )
-
-
-@dp.message(Command("chats"))
-async def chats_command(message: Message):
-    if not is_admin(message):
-        return
-
-    rows = db.execute(
-        "SELECT chat_id, enabled, title FROM chats"
-    ).fetchall()
-
-    if not rows:
-        await message.answer("Подключённых чатов нет.")
-        return
-
-    result = "\n".join(
-        f"{title or chat_id} | ID: {chat_id} | "
-        f"{'Включён' if enabled else 'Выключен'}"
-        for chat_id, enabled, title in rows
-    )
-
-    await message.answer(result)
-
-
-@dp.message(Command("removechat"))
-async def remove_chat_command(message: Message):
-    if not is_admin(message):
-        return
-
-    parts = message.text.split(maxsplit=1)
-
-    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
-        await message.answer("Используй: /removechat ID")
-        return
-        chat_id = int(parts[1])
-
-    db.execute(
-        "DELETE FROM chats WHERE chat_id = ?",
-        (chat_id,)
-    )
-    db.commit()
-
-    await message.answer("✅ Чат удалён из настроек.")
+    await m.answer("✅ Удалено." if cur.rowcount else "Номер не найден.")
 
 
 @dp.message(F.text)
-async def handle_group_message(message: Message):
-    if message.chat.type == "private":
+async def auto_reply(m: Message):
+    if m.chat.type == "private" or (m.from_user and m.from_user.is_bot):
         return
 
-    if message.from_user and message.from_user.is_bot:
-        return
-
-    text = message.text.lower().replace("ё", "е")
-
-    if text.startswith("/"):
-        return
-
-    pattern = r"(?<!\w)(?:слет|номер|дай\s+номер|нужен\s+номер)(?!\w)"
-
-    if not re.search(pattern, text):
+    if not re.search(r"\b(сл[её]т|номер)\b", m.text.lower()):
         return
 
     chat = db.execute(
-        "SELECT enabled FROM chats WHERE chat_id = ?",
-        (message.chat.id,)
+        "SELECT enabled FROM chats WHERE chat_id = ?", (m.chat.id,)
     ).fetchone()
 
     if not chat or not chat[0]:
         return
 
-    async with number_lock:
+    async with lock:
         row = db.execute(
-            "SELECT id, number FROM numbers "
-            "WHERE used = 0 ORDER BY id LIMIT 1"
+            "SELECT id, number FROM numbers WHERE used = 0 ORDER BY id LIMIT 1"
         ).fetchone()
 
         if not row:
-            await message.reply("Свободные номера закончились.")
+            await m.reply("Свободные номера закончились.")
             return
 
-        number_id, number = row
-
-        db.execute(
-            "UPDATE numbers SET used = 1 WHERE id = ?",
-            (number_id,)
-        )
+        db.execute("UPDATE numbers SET used = 1 WHERE id = ?", (row[0],))
         db.commit()
 
         try:
-            await message.reply(f"📱 Номер: {number}")
+            await m.reply(f"📱 Номер: {row[1]}")
         except Exception:
-            db.execute(
-                "UPDATE numbers SET used = 0 WHERE id = ?",
-                (number_id,)
-            )
+            db.execute("UPDATE numbers SET used = 0 WHERE id = ?", (row[0],))
             db.commit()
             raise
 
 
 async def main():
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Запуск"),
-        BotCommand(command="panel", description="Панель управления"),
-        BotCommand(command="add", description="Добавить номер"),
-        BotCommand(command="addmany", description="Добавить список номеров"),
-        BotCommand(command="list", description="Свободные номера"),
-        BotCommand(command="delete", description="Удалить номер"),
-        BotCommand(command="addchat", description="Подключить чат"),
-        BotCommand(command="chats", description="Список чатов"),
-        BotCommand(command="removechat", description="Удалить чат")
-    ])
-
     print("Number Bot 2.0 запущен!")
     await dp.start_polling(bot)
 
@@ -515,68 +277,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     finally:
         db.close()
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("toggle:"))
-async def toggle_chat(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    chat_id = int(callback.data.split(":")[1])
-
-    db.execute(
-        """
-        UPDATE chats
-        SET enabled = CASE WHEN enabled = 1 THEN 0 ELSE 1 END
-        WHERE chat_id = ?
-        """,
-        (chat_id,)
-    )
-    db.commit()
-
-    await callback.answer("Настройки чата изменены")
-    await show_chats(callback)
-
-
-@dp.callback_query(F.data.startswith("remove:"))
-async def remove_chat(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    chat_id = int(callback.data.split(":")[1])
-
-    db.execute(
-        "DELETE FROM chats WHERE chat_id = ?",
-        (chat_id,)
-    )
-    db.commit()
-
-    await callback.answer("Чат удалён")
-    await show_chats(callback)
-
-
-@dp.callback_query(F.data == "numbers")
-async def show_numbers(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-
-    total = db.execute(
-        "SELECT COUNT(*) FROM numbers"
-    ).fetchone()[0]
-
-    free = db.execute(
-        "SELECT COUNT(*) FROM numbers WHERE used = 0"
-    ).fetchone()[0]
-
-    await callback.message.answer(
-        f"📱 Номера\n\n"
-        f"Всего: {total}\n"
-        f"Свободно: {free}\n"
-        f"Выдано: {total - free}\n\n"
-        "Добавить: /add номер\n"
-        "Добавить списком: /addmany\n"
