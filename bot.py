@@ -32,6 +32,10 @@ DB_PATH = os.getenv("DB_PATH", "numbers.db")
 USER_COOLDOWN = int(os.getenv("USER_COOLDOWN", "30"))
 # Как часто писать в чат «номера закончились» (секунды).
 EMPTY_NOTICE_COOLDOWN = 300
+# Если в сообщении больше стольких слов — это «длинное предложение», номер не выдаём.
+MAX_WORDS = int(os.getenv("MAX_WORDS", "4"))
+# Фразы-исключения: по ним номер выдаётся даже в длинном сообщении.
+ALLOW_PHRASES = ("дайте номер", "дай номер", "дайте номерок", "дай номерок")
 
 if not TOKEN or not ADMIN_ID:
     raise RuntimeError("Проверь BOT_TOKEN и ADMIN_ID в .env")
@@ -136,6 +140,13 @@ def reload_chats():
 def norm(text):
     """Нижний регистр + ё -> е, чтобы «слёт» и «слет» были одним словом."""
     return text.casefold().replace("ё", "е")
+
+
+ALLOW_REGEX = re.compile(
+    r"(?<!\w)(?:"
+    + "|".join(re.escape(norm(p)).replace("\\ ", r"\s+") for p in ALLOW_PHRASES)
+    + r")(?!\w)"
+)
 
 
 def reload_keywords():
@@ -569,8 +580,13 @@ async def auto_reply(m: Message):
         return
 
     # Сначала дешёвая проверка по тексту, потом уже база
+    text = norm(m.text)
     regex = state["kw_regex"]
-    if regex is None or not regex.search(norm(m.text)):
+    if regex is None or not regex.search(text):
+        return
+
+    # Длинные предложения игнорируем, кроме фраз-исключений («дайте номер» и т.п.)
+    if len(text.split()) > MAX_WORDS and not ALLOW_REGEX.search(text):
         return
 
     if not state["enabled"] or m.chat.id not in active_chats:
@@ -603,11 +619,13 @@ async def auto_reply(m: Message):
         "WHERE id=?",
         (int(time.time()), user_id, who, m.chat.id, row[0]),
     )
-    db.commit()
+    # commit сделаем уже после отправки: соединение с базой одно, поэтому
+    # другие сообщения видят номер как занятый и дубля не будет.
 
     t1 = time.perf_counter()
     try:
         await m.reply(f"📱 Номер: {row[1]}")
+        t2 = time.perf_counter()
     except Exception:
         # Не отправилось (сообщение удалили, нет прав и т.д.) — возвращаем номер
         log.exception("Ошибка отправки номера, возвращаю его в свободные")
@@ -619,9 +637,9 @@ async def auto_reply(m: Message):
         db.commit()
         return
 
+    db.commit()
     last_issue[(m.chat.id, user_id)] = now
     purge_cooldowns(now)
-    t2 = time.perf_counter()
     log.info(
         "Номер %s выдан %s в чате %s | обработка %.1f мс, отправка в Telegram %.0f мс, "
         "сообщение дошло до бота за ~%d с",
