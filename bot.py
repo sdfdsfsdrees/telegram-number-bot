@@ -17,7 +17,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 # ============================================================ НАСТРОЙКИ
 # Впиши один раз и сохрани файл. Дальше бот запускается сразу.
-BOT_TOKEN = 9136637036:AAGBr0UXkIS9FhaJjbghpv3iTdi_kOk2ee8   # токен от @BotFather, например "123456:ABC-DEF..."
+BOT_TOKEN = 9136637036:AAHY7_H1S61HzBtPGMfufoCRUCNdEneke9A   # токен от @BotFather, например "123456:ABC-DEF..."
 ADMIN_ID = 1650081425     # твой Telegram ID (число), например 123456789
 
 USER_COOLDOWN = 30        # пауза между выдачами одному человеку в чате (сек), 0 = без паузы
