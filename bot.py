@@ -6,24 +6,30 @@ import re
 import sqlite3
 import sys
 import time
+from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup,
+    Message, ReactionTypeEmoji,
+)
 
 # ============================================================ НАСТРОЙКИ
 # Впиши один раз и сохрани файл. Дальше бот запускается сразу.
-BOT_TOKEN = 9136637036:AAHY7_H1S61HzBtPGMfufoCRUCNdEneke9A   # токен от @BotFather, например "123456:ABC-DEF..."
-ADMIN_ID = 1650081425     # твой Telegram ID (число), например 123456789
+BOT_TOKEN = ""            # токен от @BotFather в кавычках, например "123456:ABC-DEF..."
+ADMIN_ID = 1650081425     # твой Telegram ID (число)
 
 USER_COOLDOWN = 30        # пауза между выдачами одному человеку в чате (сек), 0 = без паузы
+PAUSE_REACTION = "👀"     # реакция на сообщение человека, который в паузе (⏳ Telegram не разрешает)
 MAX_WORDS = 4             # сообщения длиннее этого числа слов игнорируются...
 ALLOW_PHRASES = ("дайте номер", "дай номер", "дайте номерок", "дай номерок")  # ...кроме этих фраз
-LOW_STOCK = 5             # предупреждать, когда свободных номеров столько или меньше
+LOW_STOCK = 5             # 🔴 и предупреждение, когда свободных номеров столько или меньше
 EMPTY_NOTICE_COOLDOWN = 9999  # как часто писать в чат «номера закончились» (сек)
 # ================================================================
 
@@ -36,9 +42,15 @@ try:  # быстрый цикл событий (Linux/macOS); на Windows пр�
 except ImportError:
     pass
 
-VERSION = "4.2"
+VERSION = "5.0"
 DB_PATH = Path(__file__).resolve().parent / "numbers.db"
 LINE = "━━━━━━━━━━━━━━━━━━"
+TAP_GUARD = 1.0           # повторное нажатие той же кнопки быстрее этого (сек) игнорируется
+ERROR_COOLDOWN = 3600     # как часто повторять админу ошибку по одному и тому же чату (сек)
+CLEANUP_EVERY = 600       # как часто чистить словари в памяти (сек)
+MAX_TOKENS = 40           # сколько слов сообщения анализировать
+SPARK = "▁▂▃▄▅▆▇█"
+WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("number_bot")
@@ -51,11 +63,14 @@ for pragma in ("journal_mode=WAL", "busy_timeout=5000", "synchronous=NORMAL"):
     db.execute(f"PRAGMA {pragma}")
 
 pending = {}          # user_id -> ожидаемый ввод ("keyword" / "numbers")
+panel_msg = {}        # user_id -> id сообщения с меню (оно всегда одно)
 last_issue = {}       # (chat_id, user_id) -> время последней выдачи
 empty_notice = {}     # chat_id -> время последнего сообщения «закончились»
+chat_errors = {}      # chat_id -> время последней жалобы админу
+tap_times = {}        # (user_id, message_id, data) -> время последнего нажатия
 background = set()    # ссылки на фоновые задачи
 active_chats = set()  # chat_id включённых чатов
-state = {"admin_notified": False, "kw_regex": None, "enabled": True, "notify": True}
+state = {"admin_notified": False, "keywords": [], "enabled": True, "notify": True}
 
 
 # ---------------------------------------------------------------- База данных
@@ -111,13 +126,31 @@ def norm(text):
     return text.casefold().replace("ё", "е")
 
 
+def head(icon, *path):
+    """Единый заголовок экрана с хлебными крошками: «📜 Номера › История»."""
+    return f"{icon} <b>{' › '.join(path)}</b>\n{LINE}"
+
+
+def stock_icon(free, total):
+    if free <= LOW_STOCK:
+        return "🔴"
+    return "🟡" if free * 3 < total else "🟢"
+
+
 def bar(free, total, width=10):
+    fill = {"🟢": "🟩", "🟡": "🟨", "🔴": "🟥"}[stock_icon(free, total)]
     filled = round(width * free / total) if total else 0
-    return "▰" * filled + "▱" * (width - filled)
+    if free > 0:
+        filled = max(filled, 1)
+    return fill * filled + "⬜" * (width - filled)
 
 
-def stamp(ts):
-    return time.strftime("%d.%m %H:%M", time.localtime(ts)) if ts else "—"
+def when(ts):
+    if not ts:
+        return "—"
+    t = time.localtime(ts)
+    same_day = time.strftime("%Y%m%d", t) == time.strftime("%Y%m%d")
+    return time.strftime("%H:%M" if same_day else "%d.%m %H:%M", t)
 
 
 def count(sql, *args):
@@ -128,20 +161,70 @@ def number_counts():
     return db.execute("SELECT COUNT(*), COALESCE(SUM(used=0), 0) FROM numbers").fetchone()
 
 
-ALLOW_REGEX = re.compile(
-    r"(?<!\w)(?:"
-    + "|".join(re.escape(norm(p)).replace("\\ ", r"\s+") for p in ALLOW_PHRASES)
-    + r")(?!\w)"
-)
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    background.add(task)
+    task.add_done_callback(background.discard)
+
+
+# ------------------------------------------- Распознавание слов (с опечатками)
+
+def squeeze(word):
+    """Схлопывает повторы букв: «слетт» -> «слет»."""
+    return re.sub(r"(.)\1+", r"\1", word)
+
+
+def prep(phrase):
+    return tuple(squeeze(w) for w in re.findall(r"\w+", norm(phrase)))
+
+
+def distance(a, b, limit):
+    """Расстояние Дамерау-Левенштейна (опечатка и перестановка букв = 1)."""
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev2, prev = None, list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+@lru_cache(maxsize=4096)
+def word_match(token, key):
+    """Слово из сообщения подходит к ключевому: точно, с окончанием/суффиксом или с опечаткой."""
+    if token == key:
+        return True
+    if len(key) < 4:                      # короткие слова только точно, иначе много ложных срабатываний
+        return False
+    extra = len(token) - len(key)
+    if token.startswith(key) and extra <= 3:      # номер -> номера, номерок
+        return True
+    if len(key) < 5:
+        return False
+    limit = 1 if len(key) < 8 else 2
+    if distance(token, key, limit) <= limit:
+        return True
+    return 0 < extra <= 3 and distance(token[:len(key)], key, limit) <= limit
+
+
+def phrase_hit(stems, phrases):
+    for phrase in phrases:
+        n = len(phrase)
+        for i in range(len(stems) - n + 1):
+            if all(word_match(stems[i + j], phrase[j]) for j in range(n)):
+                return True
+    return False
+
+
+ALLOW_TOKENS = [p for p in (prep(x) for x in ALLOW_PHRASES) if p]
 
 
 def reload_keywords():
-    words = [r[0] for r in db.execute("SELECT word FROM keywords")]
-    if not words:
-        state["kw_regex"] = None
-        return
-    parts = sorted({re.escape(norm(w)) for w in words}, key=len, reverse=True)
-    state["kw_regex"] = re.compile(r"(?<!\w)(?:" + "|".join(parts) + r")(?!\w)")
+    state["keywords"] = [p for p in (prep(w) for (w,) in db.execute("SELECT word FROM keywords")) if p]
 
 
 def reload_settings():
@@ -206,6 +289,34 @@ async def safe_edit(c: CallbackQuery, text, markup):
             raise
 
 
+async def drop(chat_id, message_id):
+    """Удаляет сообщение, ошибки не важны."""
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+async def show_panel(uid, view, note=None, fresh=False):
+    """Меню всегда живёт в одном сообщении: правим его, а не шлём новые."""
+    text, markup = view
+    if note:
+        text = f"{note}\n\n{text}"
+    mid = panel_msg.get(uid)
+    if mid and fresh:
+        await drop(uid, panel_msg.pop(uid))
+        mid = None
+    if mid:
+        try:
+            await bot.edit_message_text(text, chat_id=uid, message_id=mid, reply_markup=markup)
+            return
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                return
+    sent = await bot.send_message(uid, text, reply_markup=markup)
+    panel_msg[uid] = sent.message_id
+
+
 # ------------------------------------------------------------------- Экраны
 
 def button(text, data):
@@ -230,12 +341,13 @@ def panel_view():
     words = count("SELECT COUNT(*) FROM keywords")
     status = "🟢 <b>Выдача включена</b>" if state["enabled"] else "🔴 <b>Выдача выключена</b>"
     text = (
-        f"🤖 <b>NUMBER BOT</b>  <i>v{VERSION}</i>\n{LINE}\n{status}\n\n"
-        f"📱 Номера: <b>{free}</b> свободно из <b>{total}</b>\n"
-        f"<code>{bar(free, total)}</code>\n\n"
+        f"{head('🤖', 'NUMBER BOT')}\n{status}\n\n"
+        f"📱 Номера: {stock_icon(free, total)} <b>{free}</b> свободно из <b>{total}</b>\n"
+        f"{bar(free, total)}\n\n"
         f"💬 Активных чатов: <b>{chats}</b>\n"
         f"🔑 Ключевых слов: <b>{words}</b>\n"
-        f"🔔 Уведомления: <b>{'включены' if state['notify'] else 'выключены'}</b>"
+        f"🔔 Уведомления: <b>{'включены' if state['notify'] else 'выключены'}</b>\n\n"
+        f"<i>v{VERSION}</i>"
     )
     return text, kb([
         [button("🔴 Выключить выдачу" if state["enabled"] else "🟢 Включить выдачу", "bot:toggle")],
@@ -248,9 +360,9 @@ def panel_view():
 def numbers_view():
     total, free = number_counts()
     text = (
-        f"📱 <b>НОМЕРА</b>\n{LINE}\n"
-        f"Свободно: <b>{free}</b>\nВыдано: <b>{total - free}</b>\nВсего: <b>{total}</b>\n"
-        f"<code>{bar(free, total)}</code>\n\n"
+        f"{head('📱', 'Номера')}\n"
+        f"{stock_icon(free, total)} Свободно: <b>{free}</b>\nВыдано: <b>{total - free}</b>\nВсего: <b>{total}</b>\n"
+        f"{bar(free, total)}\n\n"
         "<i>Командами:</i>\n"
         "<code>/add +79990000000</code> — один номер\n"
         "<code>/delete ID</code> — удалить по ID"
@@ -271,25 +383,23 @@ def free_view(page=0):
         "SELECT id, number FROM numbers WHERE used=0 ORDER BY id LIMIT ? OFFSET ?",
         (per_page, page * per_page)).fetchall()
     body = "\n".join(f"<code>{i}</code> · {esc(n)}" for i, n in rows) or "<i>Свободных номеров нет.</i>"
-    return (f"📋 <b>СВОБОДНЫЕ НОМЕРА</b>  ({free})\n{LINE}\n{body}",
+    return (f"{head('📋', 'Номера', 'Свободные')}  ({free})\n{body}",
             kb([pager("free", page, pages), [button("⬅️ К номерам", "numbers")]]))
 
 
 def history_view(page=0):
     total = count("SELECT COUNT(*) FROM numbers WHERE used=1")
-    per_page = 8
+    per_page = 12
     pages = max(1, math.ceil(total / per_page))
     page = max(0, min(page, pages - 1))
     rows = db.execute("""
-        SELECT n.id, n.number, n.used_at, n.used_by_name, COALESCE(c.title, n.used_chat)
-        FROM numbers n LEFT JOIN chats c ON c.chat_id = n.used_chat
-        WHERE n.used=1 ORDER BY n.used_at DESC, n.id DESC LIMIT ? OFFSET ?
+        SELECT id, number, used_at, used_by_name FROM numbers
+        WHERE used=1 ORDER BY used_at DESC, id DESC LIMIT ? OFFSET ?
     """, (per_page, page * per_page)).fetchall()
 
-    body = "\n\n".join(
-        f"<code>{nid}</code> · <b>{esc(number)}</b>\n"
-        f"    👤 {esc(who or '—')}  💬 {esc(short(chat or '—', 24))}\n    🕒 {stamp(ts)}"
-        for nid, number, ts, who, chat in rows
+    body = "\n".join(
+        f"<code>#{nid}</code> · {esc(number)} · {esc(short(who or '—', 16))} · {when(ts)}"
+        for nid, number, ts, who in rows
     ) or "<i>Выдач пока не было.</i>"
     if rows:
         body += "\n\n<i>↩️ — вернуть номер в свободные</i>"
@@ -297,13 +407,13 @@ def history_view(page=0):
     restore = [button(f"↩️ {nid}", f"restore:{nid}:{page}") for nid, *_ in rows]
     keyboard = [restore[i:i + 4] for i in range(0, len(restore), 4)]
     keyboard += [pager("hist", page, pages), [button("⬅️ К номерам", "numbers")]]
-    return f"📜 <b>ИСТОРИЯ ВЫДАЧ</b>  ({total})\n{LINE}\n{body}", kb(keyboard)
+    return f"{head('📜', 'Номера', 'История')}  ({total})\n{body}", kb(keyboard)
 
 
 def clear_view():
     used = count("SELECT COUNT(*) FROM numbers WHERE used=1")
     return (
-        f"🧹 <b>Очистить выданные?</b>\n\nБудет удалено номеров: <b>{used}</b>.\n"
+        f"{head('🧹', 'Номера', 'Очистка')}\nБудет удалено номеров: <b>{used}</b>.\n"
         "История выдач пропадёт. Свободные номера не тронем.",
         kb([[button("✅ Да, удалить", "numclear:yes"), button("✖️ Отмена", "numbers")]]),
     )
@@ -317,7 +427,7 @@ def chats_view():
         for chat_id, title, active in rows
     ] + [[button("⬅️ В меню", "home")]]
     hint = "Нажми на чат — включить или выключить. 🗑 — отключить совсем." if rows else "Чатов пока нет."
-    return (f"💬 <b>ЧАТЫ</b>\n{LINE}\n{hint}\n\n"
+    return (f"{head('💬', 'Чаты')}\n{hint}\n\n"
             "<i>Новый чат: добавь бота в группу и отправь там</i> <code>/addchat</code>",
             kb(keyboard))
 
@@ -327,16 +437,31 @@ def keywords_view():
     keyboard = [[button(f"🗑 {short(word)}", f"kwdel:{kid}")] for kid, word in rows]
     keyboard += [[button("➕ Добавить слово", "kwadd")], [button("⬅️ В меню", "home")]]
     words = ", ".join(f"<code>{esc(w)}</code>" for _, w in rows) or "<i>нет</i>"
-    return (f"🔑 <b>КЛЮЧЕВЫЕ СЛОВА</b>\n{LINE}\n{words}\n\n"
-            f"<i>Сообщения длиннее {MAX_WORDS} слов игнорируются, кроме «дай(те) номер».\n"
+    return (f"{head('🔑', 'Слова')}\n{words}\n\n"
+            f"<i>Опечатки и формы слов («слетт», «номерок») бот узнаёт сам.\n"
+            f"Сообщения длиннее {MAX_WORDS} слов игнорируются, кроме «дай(те) номер».\n"
             "Нажми на слово, чтобы удалить его.</i>", kb(keyboard))
+
+
+def week_chart():
+    """Выдачи по дням за неделю символами ▁▃▅▇. Возвращает (текст, сегодня, за неделю)."""
+    days = [date.today() - timedelta(days=i) for i in range(6, -1, -1)]
+    since = datetime.combine(days[0], datetime.min.time()).timestamp()
+    counts = dict.fromkeys(days, 0)
+    for (ts,) in db.execute("SELECT used_at FROM numbers WHERE used=1 AND used_at>=?", (since,)):
+        day = date.fromtimestamp(ts)
+        if day in counts:
+            counts[day] += 1
+    values = list(counts.values())
+    top = max(values)
+    bars = "".join(f" {SPARK[max(0, math.ceil(v / top * 8) - 1)] if v else '·'} " for v in values)
+    labels = "".join(f"{WEEKDAYS[d.weekday()]} " for d in days)
+    return f"{bars}\n{labels}", values[-1], sum(values)
 
 
 def stats_view():
     total, free = number_counts()
-    day_start = int(time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1)))
-    today = count("SELECT COUNT(*) FROM numbers WHERE used=1 AND used_at>=?", day_start)
-    week = count("SELECT COUNT(*) FROM numbers WHERE used=1 AND used_at>=?", int(time.time()) - 7 * 86400)
+    chart, today, week = week_chart()
     top = db.execute("""
         SELECT COALESCE(c.title, n.used_chat), COUNT(*) AS cnt
         FROM numbers n LEFT JOIN chats c ON c.chat_id = n.used_chat
@@ -346,11 +471,11 @@ def stats_view():
     top_text = "\n".join(
         f"  {i}. {esc(short(t, 26))} — <b>{n}</b>" for i, (t, n) in enumerate(top, 1)) or "  —"
     text = (
-        f"📊 <b>СТАТИСТИКА</b>\n{LINE}\n"
+        f"{head('📊', 'Статистика')}\n"
         f"Состояние: {'🟢 включён' if state['enabled'] else '🔴 выключен'}\n\n"
-        f"📱 Всего номеров: <b>{total}</b>\n✅ Свободно: <b>{free}</b>\n"
-        f"📤 Выдано: <b>{total - free}</b>\n<code>{bar(free, total)}</code>\n\n"
-        f"📅 Выдано сегодня: <b>{today}</b>\n🗓 За 7 дней: <b>{week}</b>\n\n"
+        f"📱 Всего номеров: <b>{total}</b>\n{stock_icon(free, total)} Свободно: <b>{free}</b>\n"
+        f"📤 Выдано: <b>{total - free}</b>\n{bar(free, total)}\n\n"
+        f"📅 Сегодня: <b>{today}</b>   🗓 За 7 дней: <b>{week}</b>\n<code>{chart}</code>\n\n"
         f"🏆 <b>Топ чатов</b>\n{top_text}"
     )
     return text, kb([[button("🔄 Обновить", "stats"), button("⬅️ В меню", "home")]])
@@ -367,18 +492,21 @@ async def start(m: Message):
     if m.chat.type != "private":
         return
     if m.from_user and is_admin(m.from_user.id):
-        pending.pop(m.from_user.id, None)
-        text, markup = panel_view()
-        await m.answer(text, reply_markup=markup)
+        uid = m.from_user.id
+        pending.pop(uid, None)
+        spawn(drop(m.chat.id, m.message_id))
+        await show_panel(uid, panel_view(), fresh=True)
     else:
         await m.answer("Бот работает.")
 
 
 @dp.message(Command("cancel"))
 async def cancel(m: Message):
-    if m.from_user:
-        pending.pop(m.from_user.id, None)
-    await m.answer("Действие отменено.")
+    if not admin_private(m):
+        return
+    pending.pop(m.from_user.id, None)
+    spawn(drop(m.chat.id, m.message_id))
+    await show_panel(m.from_user.id, panel_view(), "✖️ Действие отменено.")
 
 
 @dp.message(Command("addchat"))
@@ -401,26 +529,29 @@ async def add_chat(m: Message):
 async def add_number(m: Message):
     if not admin_private(m):
         return
+    spawn(drop(m.chat.id, m.message_id))
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await m.answer("Используй: <code>/add +79990000000</code>\n"
-                       "Список — каждый номер с новой строки.")
-        return
-    added, skipped = add_numbers(parts[1].splitlines())
-    await m.answer(f"✅ Добавлено: <b>{added}</b>\nПропущено (уже были): <b>{skipped}</b>")
+        note = "ℹ️ <code>/add +79990000000</code>, список — каждый номер с новой строки."
+    else:
+        added, skipped = add_numbers(parts[1].splitlines())
+        note = f"✅ Добавлено: <b>{added}</b> · пропущено: <b>{skipped}</b>"
+    await show_panel(m.from_user.id, numbers_view(), note)
 
 
 @dp.message(Command("delete"))
 async def delete_number(m: Message):
     if not admin_private(m):
         return
+    spawn(drop(m.chat.id, m.message_id))
     parts = m.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
-        await m.answer("Используй: <code>/delete ID</code>")
-        return
-    cur = db.execute("DELETE FROM numbers WHERE id=?", (int(parts[1]),))
-    db.commit()
-    await m.answer("✅ Удалено." if cur.rowcount else "Номер не найден.")
+        note = "ℹ️ <code>/delete ID</code>"
+    else:
+        cur = db.execute("DELETE FROM numbers WHERE id=?", (int(parts[1]),))
+        db.commit()
+        note = "✅ Удалено." if cur.rowcount else "⚠️ Номер не найден."
+    await show_panel(m.from_user.id, numbers_view(), note)
 
 
 # -------------------------------------------------------------- Кнопки (меню)
@@ -434,9 +565,17 @@ async def callbacks(c: CallbackQuery):
         await c.answer()
         return
 
-    data, toast = c.data, None
+    uid, data, toast = c.from_user.id, c.data, None
     if data != "noop":
-        pending.pop(c.from_user.id, None)  # любая навигация отменяет ожидание ввода
+        now = time.monotonic()
+        key = (uid, c.message.message_id, data)
+        if now - tap_times.get(key, float("-inf")) < TAP_GUARD:  # двойной тап
+            await c.answer()
+            return
+        tap_times[key] = now
+        pending.pop(uid, None)  # любая навигация отменяет ожидание ввода
+    if not data.endswith(":n"):  # «:n» — кнопка под уведомлением, это не меню
+        panel_msg[uid] = c.message.message_id
 
     if data == "home":
         await safe_edit(c, *panel_view())
@@ -455,9 +594,9 @@ async def callbacks(c: CallbackQuery):
         await safe_edit(c, *numbers_view())
 
     elif data == "numadd":
-        pending[c.from_user.id] = "numbers"
+        pending[uid] = "numbers"
         await safe_edit(
-            c, "➕ <b>ДОБАВИТЬ НОМЕРА</b>\n\nОтправь один номер или список — "
+            c, f"{head('➕', 'Номера', 'Добавить')}\nОтправь один номер или список — "
                "каждый с новой строки.\nПовторы бот пропустит сам.",
             kb([[button("✖️ Отмена", "numbers")]]))
 
@@ -506,8 +645,8 @@ async def callbacks(c: CallbackQuery):
         await safe_edit(c, *keywords_view())
 
     elif data == "kwadd":
-        pending[c.from_user.id] = "keyword"
-        await safe_edit(c, "✏️ <b>НОВОЕ СЛОВО</b>\n\nОтправь ключевое слово или фразу.",
+        pending[uid] = "keyword"
+        await safe_edit(c, f"{head('✏️', 'Слова', 'Добавить')}\nОтправь ключевое слово или фразу.",
                         kb([[button("✖️ Отмена", "keywords")]]))
 
     elif data.startswith("kwdel:"):
@@ -534,43 +673,44 @@ def awaiting_input(m: Message):
 
 @dp.message(F.text, awaiting_input)
 async def pending_input(m: Message):
-    kind = pending.pop(m.from_user.id, None)
+    uid = m.from_user.id
+    kind = pending.pop(uid, None)
+    spawn(drop(m.chat.id, m.message_id))  # убираем сообщение админа, чтобы чат был чистым
 
     if kind == "numbers":
         added, skipped = add_numbers(m.text.splitlines())
-        await m.answer(f"✅ Добавлено: <b>{added}</b>\nПропущено (уже были): <b>{skipped}</b>",
-                       reply_markup=kb([[button("⬅️ К номерам", "numbers")]]))
+        await show_panel(uid, numbers_view(),
+                         f"✅ Добавлено: <b>{added}</b> · пропущено: <b>{skipped}</b>")
         return
 
     word = m.text.strip()
     if not word or len(word) > 60:
-        await m.answer("Слово пустое или слишком длинное.")
+        await show_panel(uid, keywords_view(), "⚠️ Слово пустое или слишком длинное.")
         return
     try:
         db.execute("INSERT INTO keywords (word) VALUES (?)", (word,))
         db.commit()
     except sqlite3.IntegrityError:
-        await m.answer("Такое слово уже есть.")
+        await show_panel(uid, keywords_view(), "⚠️ Такое слово уже есть.")
         return
     reload_keywords()
-    await m.answer(f"✅ Добавлено: <code>{esc(word)}</code>",
-                   reply_markup=kb([[button("⬅️ К словам", "keywords")]]))
+    await show_panel(uid, keywords_view(), f"✅ Добавлено: <code>{esc(word)}</code>")
 
 
-# ---------------------------------------------- Уведомление админу о выдаче
+# ------------------------------------------------ Уведомления админу и ошибки
 
 async def notify_admin(m: Message, number_id, number):
     try:
         user = m.from_user
         username = f" (@{esc(user.username)})" if user.username else ""
-        _, free = number_counts()
+        total, free = number_counts()
         lines = [
-            "🔔 <b>Выдан номер</b>", LINE,
+            head("🔔", "Выдан номер"),
             f"📱 <code>{esc(number)}</code>",
             f'👤 <a href="tg://user?id={user.id}">{esc(user.full_name)}</a>{username}',
             f"💬 {esc(m.chat.title or m.chat.id)}",
             f"✉️ <i>{esc(short(m.text, 80))}</i>",
-            "", f"Осталось свободных: <b>{free}</b>",
+            "", f"{stock_icon(free, total)} Осталось свободных: <b>{free}</b> из {total}", bar(free, total),
         ]
         if free <= LOW_STOCK:
             lines.append("⚠️ <b>Номера заканчиваются!</b> Пополни: /add")
@@ -585,6 +725,28 @@ async def notify_admin(m: Message, number_id, number):
         log.exception("Не удалось отправить уведомление админу")
 
 
+async def report_chat_error(chat, exc):
+    """Одна строка админу, если бот не может писать в чат. Повторы по тому же чату — раз в час."""
+    if not isinstance(exc, (TelegramForbiddenError, TelegramBadRequest)):
+        return
+    now = time.monotonic()
+    if now - chat_errors.get(chat.id, float("-inf")) < ERROR_COOLDOWN:
+        return
+    chat_errors[chat.id] = now
+    err = str(exc).lower()
+    title = esc(chat.title or chat.id)
+    if any(k in err for k in ("kicked", "not a member", "chat not found", "deactivated")):
+        line = f"⚠️ Бота удалили из чата «{title}»."
+    elif any(k in err for k in ("rights", "write_forbidden", "not enough", "restricted", "can't send")):
+        line = f"⚠️ В чате «{title}» нет прав писать."
+    else:
+        line = f"⚠️ В чате «{title}» не удалось отправить сообщение: {esc(short(exc, 80))}"
+    try:
+        await bot.send_message(ADMIN_ID, line)
+    except Exception:
+        log.exception("Не удалось отправить админу сообщение об ошибке")
+
+
 # ---------------------------------------------------------- Автоматическая выдача
 
 async def handle_empty(m: Message):
@@ -593,71 +755,113 @@ async def handle_empty(m: Message):
         empty_notice[m.chat.id] = now
         try:
             await m.reply("😔 Свободные номера закончились.")
-        except Exception:
-            log.exception("Не удалось отправить сообщение о конце номеров")
+        except Exception as e:
+            log.warning("Не удалось отправить сообщение о конце номеров: %s", e)
+            await report_chat_error(m.chat, e)
 
     if not state["admin_notified"]:
         state["admin_notified"] = True
         try:
             await bot.send_message(
-                ADMIN_ID, "⚠️ <b>Свободные номера закончились.</b>\nДобавь новые: /add")
+                ADMIN_ID, f"{head('⚠️', 'Номера закончились')}\nДобавь новые: /add")
         except Exception:
             log.exception("Не удалось уведомить админа")
 
 
+async def react_pause(m: Message):
+    """Человек в паузе: вместо молчания ставим реакцию, чтобы было видно, что сообщение замечено."""
+    try:
+        await bot.set_message_reaction(
+            m.chat.id, m.message_id, reaction=[ReactionTypeEmoji(emoji=PAUSE_REACTION)])
+    except Exception:
+        log.debug("Не удалось поставить реакцию", exc_info=True)
+
+
+async def after_issue(m: Message, number_id, number, who):
+    """Всё, что не нужно для ответа человеку, делаем уже после него."""
+    db.commit()
+    log.info("Номер %s выдан %s в чате %s", number, who, m.chat.id)
+    if state["notify"]:
+        await notify_admin(m, number_id, number)
+
+
+def is_reply_to_other(m: Message):
+    r = m.reply_to_message
+    if not r or r.forum_topic_created:  # в темах форума ответ на «корень» темы — не ответ человеку
+        return False
+    return not (r.from_user and r.from_user.id == m.from_user.id)
+
+
 @dp.message(F.text)
 async def auto_reply(m: Message):
-    if m.chat.type == "private" or not m.from_user or m.from_user.is_bot:
-        return
-
-    text = norm(m.text)
-    regex = state["kw_regex"]
-    if regex is None or not regex.search(text):
-        return
-    if len(text.split()) > MAX_WORDS and not ALLOW_REGEX.search(text):
+    started = time.perf_counter()
+    user = m.from_user
+    if (m.chat.type == "private" or not user or user.is_bot or m.via_bot
+            or m.forward_origin or is_reply_to_other(m)):
         return
     if not state["enabled"] or m.chat.id not in active_chats:
         return
 
-    user_id = m.from_user.id
-    now = time.monotonic()
+    text = norm(m.text)
+    stems = [squeeze(t) for t in re.findall(r"\w+", text)[:MAX_TOKENS]]
+    if not phrase_hit(stems, state["keywords"]):
+        return
+    if len(text.split()) > MAX_WORDS and not phrase_hit(stems, ALLOW_TOKENS):
+        return
 
-    if USER_COOLDOWN and not is_admin(user_id):
-        last = last_issue.get((m.chat.id, user_id))
+    now = time.monotonic()
+    key = (m.chat.id, user.id)
+    if USER_COOLDOWN and not is_admin(user.id):
+        last = last_issue.get(key)
         if last is not None and now - last < USER_COOLDOWN:
+            spawn(react_pause(m))
             return
 
     # Между SELECT и UPDATE нет await, поэтому два сообщения не получат один номер.
     row = db.execute("SELECT id, number FROM numbers WHERE used=0 ORDER BY id LIMIT 1").fetchone()
     if not row:
-        await handle_empty(m)
+        spawn(handle_empty(m))
         return
+    number_id, number = row
 
-    who = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
+    who = f"@{user.username}" if user.username else user.full_name
     db.execute(
         "UPDATE numbers SET used=1, used_at=?, used_by=?, used_by_name=?, used_chat=? WHERE id=?",
-        (int(time.time()), user_id, who, m.chat.id, row[0]))
+        (int(time.time()), user.id, who, m.chat.id, number_id))
+    last_issue[key] = now  # ставим до отправки, чтобы быстрый второй запрос не прошёл
 
+    elapsed = max(time.perf_counter() - started, 0.01)
+    card = (
+        f"📱 <b>Ваш номер</b>\n<code>{esc(number)}</code>\n\n"
+        f"👤 {esc(short(user.full_name, 30))}\n"
+        f"⚡ выдан за {elapsed:.2f} с"
+    )
+    copy = kb([[InlineKeyboardButton(text="📋 Скопировать", copy_text=CopyTextButton(text=number))]])
     try:
-        await m.reply(f"📱 Номер: <code>{esc(row[1])}</code>")
-    except Exception:
+        await m.reply(card, reply_markup=copy)
+    except Exception as e:
         log.exception("Ошибка отправки номера, возвращаю его в свободные")
-        db.execute(f"UPDATE numbers SET {FREE_SQL} WHERE id=?", (row[0],))
+        db.execute(f"UPDATE numbers SET {FREE_SQL} WHERE id=?", (number_id,))
         db.commit()
+        last_issue.pop(key, None)
+        spawn(report_chat_error(m.chat, e))
         return
 
-    db.commit()
-    last_issue[(m.chat.id, user_id)] = now
-    if len(last_issue) > 5000:
-        for key in [k for k, t in last_issue.items() if now - t > USER_COOLDOWN]:
-            del last_issue[key]
+    spawn(after_issue(m, number_id, number, who))
 
-    if state["notify"]:
-        task = asyncio.create_task(notify_admin(m, row[0], row[1]))
-        background.add(task)
-        task.add_done_callback(background.discard)
 
-    log.info("Номер %s выдан %s в чате %s", row[1], who, m.chat.id)
+# ------------------------------------------------------------- Очистка памяти
+
+async def janitor():
+    """Раз в несколько минут выбрасывает из словарей устаревшие записи."""
+    stores = ((last_issue, USER_COOLDOWN), (empty_notice, EMPTY_NOTICE_COOLDOWN),
+              (chat_errors, ERROR_COOLDOWN), (tap_times, TAP_GUARD))
+    while True:
+        await asyncio.sleep(CLEANUP_EVERY)
+        now = time.monotonic()
+        for store, ttl in stores:
+            for k in [k for k, t in store.items() if now - t > ttl]:
+                del store[k]
 
 
 # ----------------------------------------------------------------------- Запуск
@@ -666,10 +870,12 @@ async def main():
     reload_keywords()
     reload_settings()
     reload_chats()
+    cleaner = asyncio.create_task(janitor())
     log.info("NUMBER BOT %s запущен!", VERSION)
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
+        cleaner.cancel()
         await bot.session.close()
         db.close()
 
