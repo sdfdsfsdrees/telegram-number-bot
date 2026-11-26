@@ -2,6 +2,7 @@ import asyncio
 import html
 import logging
 import math
+import os
 import re
 import sqlite3
 import sys
@@ -10,15 +11,22 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 # ============================================================ НАСТРОЙКИ
-# Впиши один раз и сохрани файл. Дальше бот запускается сразу.
-BOT_TOKEN = 9136637036:AAGBr0UXkIS9FhaJjbghpv3iTdi_kOk2ee8   # токен от @BotFather, например "123456:ABC-DEF..."
-ADMIN_ID = 1650081425     # твой Telegram ID (число), например 123456789
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_НОВЫЙ_ТОКЕН")  # токен от @BotFather (лучше через переменную окружения)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1650081425"))         # твой Telegram ID
+
+# Прокси, если Telegram заблокирован. Примеры:
+#   "http://127.0.0.1:10809"   (HTTP-прокси от v2rayN и т.п.)
+#   "socks5://127.0.0.1:10808" (нужно: pip install aiohttp_socks)
+# Если используешь VPN на весь компьютер — оставь пустым.
+PROXY = os.getenv("PROXY", "")
+REQUEST_TIMEOUT = 60      # таймаут запросов к Telegram (сек)
 
 USER_COOLDOWN = 30        # пауза между выдачами одному человеку в чате (сек), 0 = без паузы
 MAX_WORDS = 4             # сообщения длиннее этого числа слов игнорируются...
@@ -27,23 +35,24 @@ LOW_STOCK = 5             # предупреждать, когда свобод�
 EMPTY_NOTICE_COOLDOWN = 9999  # как часто писать в чат «номера закончились» (сек)
 # ================================================================
 
-if not BOT_TOKEN or not ADMIN_ID:
+if not BOT_TOKEN or BOT_TOKEN.startswith("ВСТАВЬ") or not ADMIN_ID:
     sys.exit("Впиши BOT_TOKEN и ADMIN_ID в начале файла bot.py и запусти снова.")
 
-try:  # быстрый цикл событий (Linux/macOS); на Windows пропускается
+try:  # быстрый цикл событий (Linux/macOS)
     import uvloop
     uvloop.install()
 except ImportError:
     pass
 
-VERSION = "4.2"
+VERSION = "4.3"
 DB_PATH = Path(__file__).resolve().parent / "numbers.db"
 LINE = "━━━━━━━━━━━━━━━━━━"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("number_bot")
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+session = AiohttpSession(proxy=PROXY or None, timeout=REQUEST_TIMEOUT)
+bot = Bot(BOT_TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -65,30 +74,34 @@ def add_column(table, column, ddl):
         db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
-db.execute("""CREATE TABLE IF NOT EXISTS numbers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT NOT NULL, used INTEGER DEFAULT 0)""")
-db.execute("""CREATE TABLE IF NOT EXISTS chats (
-    chat_id INTEGER PRIMARY KEY, title TEXT DEFAULT '', enabled INTEGER DEFAULT 1)""")
-db.execute("""CREATE TABLE IF NOT EXISTS keywords (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, word TEXT UNIQUE COLLATE NOCASE)""")
-db.execute("CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT)")
+def init_db():
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS numbers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, number TEXT NOT NULL, used INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS chats (
+            chat_id INTEGER PRIMARY KEY, title TEXT DEFAULT '', enabled INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS keywords (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, word TEXT UNIQUE COLLATE NOCASE);
+        CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT);
+    """)
+    # Миграции старой базы
+    add_column("chats", "title", "TEXT DEFAULT ''")
+    add_column("numbers", "used", "INTEGER DEFAULT 0")
+    add_column("numbers", "used_at", "INTEGER")
+    add_column("numbers", "used_by", "INTEGER")
+    add_column("numbers", "used_by_name", "TEXT")
+    add_column("numbers", "used_chat", "INTEGER")
 
-# Миграции старой базы
-add_column("chats", "title", "TEXT DEFAULT ''")
-add_column("numbers", "used", "INTEGER DEFAULT 0")
-add_column("numbers", "used_at", "INTEGER")
-add_column("numbers", "used_by", "INTEGER")
-add_column("numbers", "used_by_name", "TEXT")
-add_column("numbers", "used_chat", "INTEGER")
+    db.execute("INSERT OR IGNORE INTO settings VALUES ('enabled', '1')")
+    db.execute("INSERT OR IGNORE INTO settings VALUES ('notify', '1')")
+    db.executemany("INSERT OR IGNORE INTO keywords (word) VALUES (?)", [("слет",), ("номер",)])
+    db.execute("CREATE INDEX IF NOT EXISTS idx_numbers_used ON numbers(used, id)")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_numbers_number ON numbers(number)")
+    db.commit()
 
-db.execute("INSERT OR IGNORE INTO settings VALUES ('enabled', '1')")
-db.execute("INSERT OR IGNORE INTO settings VALUES ('notify', '1')")
-for _w in ("слет", "номер"):
-    db.execute("INSERT OR IGNORE INTO keywords (word) VALUES (?)", (_w,))
-db.execute("CREATE INDEX IF NOT EXISTS idx_numbers_used ON numbers(used, id)")
-db.commit()
 
-FREE_SQL = ("used=0, used_at=NULL, used_by=NULL, used_by_name=NULL, used_chat=NULL")
+init_db()
+FREE_SQL = "used=0, used_at=NULL, used_by=NULL, used_by_name=NULL, used_chat=NULL"
 
 
 # ------------------------------------------------------------------- Помощники
@@ -150,6 +163,11 @@ def reload_settings():
     state["notify"] = rows.get("notify", "1") == "1"
 
 
+def reload_chats():
+    active_chats.clear()
+    active_chats.update(r[0] for r in db.execute("SELECT chat_id FROM chats WHERE enabled=1"))
+
+
 def set_setting(name, value):
     db.execute(
         "INSERT INTO settings (name, value) VALUES (?, ?) "
@@ -158,21 +176,13 @@ def set_setting(name, value):
     reload_settings()
 
 
-def reload_chats():
-    active_chats.clear()
-    active_chats.update(r[0] for r in db.execute("SELECT chat_id FROM chats WHERE enabled=1"))
-
-
 def add_numbers(numbers):
-    """Возвращает (добавлено, пропущено)."""
-    numbers = list(dict.fromkeys(n.strip() for n in numbers if n.strip()))
-    added = 0
-    for number in numbers:
-        if len(number) <= 32 and not db.execute(
-                "SELECT 1 FROM numbers WHERE number=?", (number,)).fetchone():
-            db.execute("INSERT INTO numbers (number) VALUES (?)", (number,))
-            added += 1
+    """Возвращает (добавлено, пропущено). Дубликаты отсекает UNIQUE-индекс."""
+    numbers = list(dict.fromkeys(n.strip() for n in numbers if n.strip() and len(n.strip()) <= 32))
+    before = db.total_changes
+    db.executemany("INSERT OR IGNORE INTO numbers (number) VALUES (?)", [(n,) for n in numbers])
     db.commit()
+    added = db.total_changes - before
     if added:
         state["admin_notified"] = False
     return added, len(numbers) - added
@@ -206,6 +216,12 @@ async def safe_edit(c: CallbackQuery, text, markup):
             raise
 
 
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    background.add(task)
+    task.add_done_callback(background.discard)
+
+
 # ------------------------------------------------------------------- Экраны
 
 def button(text, data):
@@ -222,6 +238,11 @@ def pager(prefix, page, pages):
     if page < pages - 1:
         row.append(button("▶️", f"{prefix}:{page + 1}"))
     return row
+
+
+def clamp_page(page, total, per_page):
+    pages = max(1, math.ceil(total / per_page))
+    return max(0, min(page, pages - 1)), pages
 
 
 def panel_view():
@@ -265,8 +286,7 @@ def numbers_view():
 def free_view(page=0):
     _, free = number_counts()
     per_page = 10
-    pages = max(1, math.ceil(free / per_page))
-    page = max(0, min(page, pages - 1))
+    page, pages = clamp_page(page, free, per_page)
     rows = db.execute(
         "SELECT id, number FROM numbers WHERE used=0 ORDER BY id LIMIT ? OFFSET ?",
         (per_page, page * per_page)).fetchall()
@@ -278,8 +298,7 @@ def free_view(page=0):
 def history_view(page=0):
     total = count("SELECT COUNT(*) FROM numbers WHERE used=1")
     per_page = 8
-    pages = max(1, math.ceil(total / per_page))
-    page = max(0, min(page, pages - 1))
+    page, pages = clamp_page(page, total, per_page)
     rows = db.execute("""
         SELECT n.id, n.number, n.used_at, n.used_by_name, COALESCE(c.title, n.used_chat)
         FROM numbers n LEFT JOIN chats c ON c.chat_id = n.used_chat
@@ -294,7 +313,7 @@ def history_view(page=0):
     if rows:
         body += "\n\n<i>↩️ — вернуть номер в свободные</i>"
 
-    restore = [button(f"↩️ {nid}", f"restore:{nid}:{page}") for nid, *_ in rows]
+    restore = [button(f"↩️ {r[0]}", f"restore:{r[0]}:{page}") for r in rows]
     keyboard = [restore[i:i + 4] for i in range(0, len(restore), 4)]
     keyboard += [pager("hist", page, pages), [button("⬅️ К номерам", "numbers")]]
     return f"📜 <b>ИСТОРИЯ ВЫДАЧ</b>  ({total})\n{LINE}\n{body}", kb(keyboard)
@@ -354,6 +373,15 @@ def stats_view():
         f"🏆 <b>Топ чатов</b>\n{top_text}"
     )
     return text, kb([[button("🔄 Обновить", "stats"), button("⬅️ В меню", "home")]])
+
+
+# Простые экраны без параметров
+SCREENS = {
+    "home": panel_view, "numbers": numbers_view, "chats": chats_view,
+    "keywords": keywords_view, "stats": stats_view, "numclear": clear_view,
+}
+# Экраны со страницей: "free:3", "hist:0"
+PAGED = {"free": free_view, "hist": history_view}
 
 
 # --------------------------------------------------------------------- Команды
@@ -435,11 +463,15 @@ async def callbacks(c: CallbackQuery):
         return
 
     data, toast = c.data, None
+    action, _, arg = data.partition(":")
     if data != "noop":
         pending.pop(c.from_user.id, None)  # любая навигация отменяет ожидание ввода
 
-    if data == "home":
-        await safe_edit(c, *panel_view())
+    if data in SCREENS:
+        await safe_edit(c, *SCREENS[data]())
+
+    elif action in PAGED:
+        await safe_edit(c, *PAGED[action](int(arg)))
 
     elif data == "bot:toggle":
         set_setting("enabled", "0" if state["enabled"] else "1")
@@ -451,9 +483,6 @@ async def callbacks(c: CallbackQuery):
         await safe_edit(c, *panel_view())
         toast = "Уведомления включены" if state["notify"] else "Уведомления выключены"
 
-    elif data == "numbers":
-        await safe_edit(c, *numbers_view())
-
     elif data == "numadd":
         pending[c.from_user.id] = "numbers"
         await safe_edit(
@@ -461,14 +490,8 @@ async def callbacks(c: CallbackQuery):
                "каждый с новой строки.\nПовторы бот пропустит сам.",
             kb([[button("✖️ Отмена", "numbers")]]))
 
-    elif data.startswith("free:"):
-        await safe_edit(c, *free_view(int(data.split(":")[1])))
-
-    elif data.startswith("hist:"):
-        await safe_edit(c, *history_view(int(data.split(":")[1])))
-
-    elif data.startswith("restore:"):
-        _, nid, where = data.split(":")
+    elif action == "restore":
+        nid, where = arg.split(":")
         ok = restore_by_id(int(nid))
         toast = "↩️ Номер возвращён" if ok else "Номер уже свободен"
         if where == "n":  # нажали под уведомлением о выдаче
@@ -477,47 +500,35 @@ async def callbacks(c: CallbackQuery):
         else:             # нажали в истории
             await safe_edit(c, *history_view(int(where)))
 
-    elif data == "numclear":
-        await safe_edit(c, *clear_view())
-
     elif data == "numclear:yes":
         cur = db.execute("DELETE FROM numbers WHERE used=1")
         db.commit()
         toast = f"Удалено: {cur.rowcount}"
         await safe_edit(c, *numbers_view())
 
-    elif data == "chats":
-        await safe_edit(c, *chats_view())
-
-    elif data.startswith("chat:"):
-        db.execute("UPDATE chats SET enabled=1-enabled WHERE chat_id=?", (int(data.split(":")[1]),))
+    elif action == "chat":
+        db.execute("UPDATE chats SET enabled=1-enabled WHERE chat_id=?", (int(arg),))
         db.commit()
         reload_chats()
         await safe_edit(c, *chats_view())
 
-    elif data.startswith("remove:"):
-        db.execute("DELETE FROM chats WHERE chat_id=?", (int(data.split(":")[1]),))
+    elif action == "remove":
+        db.execute("DELETE FROM chats WHERE chat_id=?", (int(arg),))
         db.commit()
         reload_chats()
         await safe_edit(c, *chats_view())
         toast = "Чат отключён"
-
-    elif data == "keywords":
-        await safe_edit(c, *keywords_view())
 
     elif data == "kwadd":
         pending[c.from_user.id] = "keyword"
         await safe_edit(c, "✏️ <b>НОВОЕ СЛОВО</b>\n\nОтправь ключевое слово или фразу.",
                         kb([[button("✖️ Отмена", "keywords")]]))
 
-    elif data.startswith("kwdel:"):
-        db.execute("DELETE FROM keywords WHERE id=?", (int(data.split(":")[1]),))
+    elif action == "kwdel":
+        db.execute("DELETE FROM keywords WHERE id=?", (int(arg),))
         db.commit()
         reload_keywords()
         await safe_edit(c, *keywords_view())
-
-    elif data == "stats":
-        await safe_edit(c, *stats_view())
 
     await c.answer(toast)
 
@@ -557,7 +568,7 @@ async def pending_input(m: Message):
                    reply_markup=kb([[button("⬅️ К словам", "keywords")]]))
 
 
-# ---------------------------------------------- Уведомление админу о выдаче
+# ---------------------------------------------- Уведомления админу
 
 async def notify_admin(m: Message, number_id, number):
     try:
@@ -585,8 +596,6 @@ async def notify_admin(m: Message, number_id, number):
         log.exception("Не удалось отправить уведомление админу")
 
 
-# ---------------------------------------------------------- Автоматическая выдача
-
 async def handle_empty(m: Message):
     now = time.monotonic()
     if now - empty_notice.get(m.chat.id, float("-inf")) > EMPTY_NOTICE_COOLDOWN:
@@ -605,59 +614,60 @@ async def handle_empty(m: Message):
             log.exception("Не удалось уведомить админа")
 
 
+# ---------------------------------------------------------- Автоматическая выдача
+
 @dp.message(F.text)
 async def auto_reply(m: Message):
+    # Самые дешёвые проверки — первыми, чтобы не тратить время на чужие сообщения
     if m.chat.type == "private" or not m.from_user or m.from_user.is_bot:
-        return
-
-    text = norm(m.text)
-    regex = state["kw_regex"]
-    if regex is None or not regex.search(text):
-        return
-    if len(text.split()) > MAX_WORDS and not ALLOW_REGEX.search(text):
         return
     if not state["enabled"] or m.chat.id not in active_chats:
         return
 
+    regex = state["kw_regex"]
+    text = norm(m.text)
+    if regex is None or not regex.search(text):
+        return
+    if len(text.split()) > MAX_WORDS and not ALLOW_REGEX.search(text):
+        return
+
     user_id = m.from_user.id
     now = time.monotonic()
-
     if USER_COOLDOWN and not is_admin(user_id):
         last = last_issue.get((m.chat.id, user_id))
         if last is not None and now - last < USER_COOLDOWN:
             return
 
-    # Между SELECT и UPDATE нет await, поэтому два сообщения не получат один номер.
-    row = db.execute("SELECT id, number FROM numbers WHERE used=0 ORDER BY id LIMIT 1").fetchone()
+    who = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
+    # Атомарно: выбрать первый свободный номер и сразу пометить выданным
+    row = db.execute(
+        """UPDATE numbers SET used=1, used_at=?, used_by=?, used_by_name=?, used_chat=?
+           WHERE id = (SELECT id FROM numbers WHERE used=0 ORDER BY id LIMIT 1)
+           RETURNING id, number""",
+        (int(time.time()), user_id, who, m.chat.id)).fetchone()
+    db.commit()
+
     if not row:
         await handle_empty(m)
         return
-
-    who = f"@{m.from_user.username}" if m.from_user.username else m.from_user.full_name
-    db.execute(
-        "UPDATE numbers SET used=1, used_at=?, used_by=?, used_by_name=?, used_chat=? WHERE id=?",
-        (int(time.time()), user_id, who, m.chat.id, row[0]))
+    number_id, number = row
 
     try:
-        await m.reply(f"📱 Номер: <code>{esc(row[1])}</code>")
+        await m.reply(f"📱 Номер: <code>{esc(number)}</code>")
     except Exception:
         log.exception("Ошибка отправки номера, возвращаю его в свободные")
-        db.execute(f"UPDATE numbers SET {FREE_SQL} WHERE id=?", (row[0],))
-        db.commit()
+        restore_by_id(number_id)
         return
 
-    db.commit()
     last_issue[(m.chat.id, user_id)] = now
     if len(last_issue) > 5000:
         for key in [k for k, t in last_issue.items() if now - t > USER_COOLDOWN]:
             del last_issue[key]
 
     if state["notify"]:
-        task = asyncio.create_task(notify_admin(m, row[0], row[1]))
-        background.add(task)
-        task.add_done_callback(background.discard)
+        spawn(notify_admin(m, number_id, number))
 
-    log.info("Номер %s выдан %s в чате %s", row[1], who, m.chat.id)
+    log.info("Номер %s выдан %s в чате %s", number, who, m.chat.id)
 
 
 # ----------------------------------------------------------------------- Запуск
@@ -666,13 +676,27 @@ async def main():
     reload_keywords()
     reload_settings()
     reload_chats()
-    log.info("NUMBER BOT %s запущен!", VERSION)
+    log.info("NUMBER BOT %s запущен! Прокси: %s", VERSION, PROXY or "нет")
+
+    delay = 5
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+        while True:
+            try:
+                await dp.start_polling(
+                    bot, allowed_updates=["message", "callback_query"], close_bot_session=False)
+                break  # штатная остановка
+            except TelegramNetworkError as e:
+                log.error("Нет связи с Telegram (%s). Повтор через %s сек. "
+                          "Проверь VPN/прокси.", e, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
     finally:
         await bot.session.close()
         db.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
